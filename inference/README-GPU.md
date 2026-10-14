@@ -1,5 +1,7 @@
 # Setting up the GPU machine (TotalSegmentator)
 
+> **NVIDIA Jetson (AGX Xavier, Orin) on JetPack 5?** Use the Docker setup in `jetson/README-JETSON.md` instead: JetPack 5 is limited to Python 3.8.
+
 The GPU machine runs `server.py`. It does two jobs for the web app:
 
 - **DICOM → NIfTI**: the app uploads a DICOM folder or .zip; the server picks the CT series with the most slices and converts it. Names, IDs and dates do not survive the conversion.
@@ -7,11 +9,24 @@ The GPU machine runs `server.py`. It does two jobs for the web app:
 
 ## 1. Install (once)
 
+Install the server into the **same Python that already runs TotalSegmentator**. Find it first:
+
 ```bash
+head -1 "$(which TotalSegmentator)"      # e.g. #!/home/you/miniconda3/envs/totalseg/bin/python
+```
+
+Use that path as `PY` (or activate that conda/venv environment), then:
+
+```bash
+PY=/home/you/miniconda3/envs/totalseg/bin/python    # ← the path printed above, without "#!"
 cd inference
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt          # FastAPI, TotalSegmentator, SimpleITK, nibabel …
-totalseg_set_license -l <your-licence-key>   # tissue_types needs it (free academic licence)
+$PY -m pip install -r requirements.txt
+```
+
+TotalSegmentator `tissue_types` needs a licence key (free for academic use; request it on the TotalSegmentator GitHub page). Replace `ABC123` with your real key, without angle brackets:
+
+```bash
+totalseg_set_license -l ABC123
 ```
 
 Model weights download on the first run, so that run needs internet access and takes longer.
@@ -28,8 +43,10 @@ If the first command says the licence is missing, repeat `totalseg_set_license`.
 ## 3. Start the server
 
 ```bash
-MODEL=totalseg API_KEY=change-me uvicorn server:app --host 0.0.0.0 --port 8000
+MODEL=totalseg API_KEY=change-me $PY -m uvicorn server:app --host 0.0.0.0 --port 8000
 ```
+
+`$PY -m uvicorn` works even when the `uvicorn` command is not on your PATH.
 
 Options (environment variables):
 

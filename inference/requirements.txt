@@ -1,9 +1,9 @@
-fastapi>=0.110
-uvicorn>=0.29
-nibabel>=5.2
-numpy>=1.26
-# Add one of these for real models:
-TotalSegmentator>=2.4   # remove if you only use MODEL=nnunet or demo
-# nnunetv2>=2.5
+# Works on Python 3.8+. Install into the SAME Python environment that has TotalSegmentator
+# (find it with: head -1 "$(which TotalSegmentator)").
+fastapi>=0.100
+uvicorn>=0.22
+nibabel>=4.0
+numpy>=1.21
 psutil>=5.9
-SimpleITK>=2.3   # DICOM → NIfTI conversion
+SimpleITK>=2.2   # DICOM → NIfTI conversion
+# TotalSegmentator is assumed to be installed already. If not: pip install TotalSegmentator  (needs Python 3.9+)

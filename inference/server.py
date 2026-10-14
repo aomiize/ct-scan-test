@@ -17,6 +17,7 @@ MODEL (env var) picks the backend:
               totalseg_set_license -l <your key>
             AUTO_L3=1 (default) also runs the free "total" model on vertebrae_L3 and adds it as label 50,
             so the viewer can set the L3 slice by itself. TOTALSEG_FAST=1 uses the faster 3 mm models.
+            TOTALSEG_THREADS=1 lowers memory use (fewer worker processes).
   nnunet    nnUNetv2_predict with NNUNET_DATASET / NNUNET_CONFIG / NNUNET_FOLDS
             (your own model; set LABEL_SCHEME=generic or totalseg to match its label numbers)
   demo      HU thresholds only (generic labels: 1 muscle-range, 3 fat-range). Pipeline test only.
@@ -51,6 +52,8 @@ MODEL = os.environ.get("MODEL", "demo")
 TOTALSEG_TASK = os.environ.get("TOTALSEG_TASK", "tissue_types")
 AUTO_L3 = os.environ.get("AUTO_L3", "1") == "1"
 TOTALSEG_FAST = os.environ.get("TOTALSEG_FAST", "0") == "1"
+# Worker processes for resampling/saving. Fewer = less memory (each worker can hold a copy of the volume).
+TOTALSEG_THREADS = os.environ.get("TOTALSEG_THREADS", "")
 L3_LABEL = 50
 API_KEY = os.environ.get("API_KEY", "")
 MAX_BYTES = 1024**3
@@ -397,6 +400,8 @@ def run_model(run: Run, ct: Path, work: Path) -> tuple[Path, dict[int, str] | No
     if MODEL == "totalseg":
         out = work / "tissue.nii.gz"
         fast = ["--fast"] if TOTALSEG_FAST else []
+        if TOTALSEG_THREADS:
+            fast += ["-nr", TOTALSEG_THREADS, "-ns", TOTALSEG_THREADS]
         with run.stage("inference"):
             stream_cmd(run, ["TotalSegmentator", "-i", str(ct), "-o", str(out), "--task", TOTALSEG_TASK, "--ml", *fast], "TOTALSEG")
         labels = totalseg_labels(TOTALSEG_TASK)
