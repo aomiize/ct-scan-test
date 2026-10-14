@@ -1,0 +1,8 @@
+fastapi>=0.110
+uvicorn>=0.29
+nibabel>=5.2
+numpy>=1.26
+# Add one of these for real models:
+# TotalSegmentator>=2.4
+# nnunetv2>=2.5
+psutil>=5.9
