@@ -50,6 +50,7 @@ interface Props {
   reportBusy: boolean;
   onOpenCase: (c: CaseEntry) => void;
   onOpenCT: (f: File) => void;
+  onOpenDicom: (files: File[]) => void;
   onOpenMask: (f: File) => void;
   onSample: () => void;
   onSegment: () => void;
@@ -126,6 +127,16 @@ export default function Sidebar(p: Props) {
             <input id="f-mask" type="file" accept=".nii,.gz" onChange={pickFile(p.onOpenMask)} disabled={p.busy || !p.vol} />
           </label>
           <button type="button" className="btn" onClick={p.onSample} disabled={p.busy}>Sample</button>
+        </div>
+        <div className="row">
+          <label className={`btn file${p.inferenceReady ? '' : ' off'}`} title={p.inferenceReady ? 'Choose the folder that holds one DICOM study' : 'DICOM conversion runs on the inference server (INFERENCE_URL)'}>
+            DICOM folder…
+            <input id="f-dcm-dir" type="file" multiple onChange={(e) => { const fs = [...(e.target.files ?? [])]; e.target.value = ''; p.onOpenDicom(fs); }} disabled={p.busy || !p.inferenceReady} {...({ webkitdirectory: '', directory: '' } as Record<string, string>)} />
+          </label>
+          <label className={`btn file${p.inferenceReady ? '' : ' off'}`}>
+            DICOM .zip…
+            <input id="f-dcm-zip" type="file" accept=".zip" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ''; if (f) p.onOpenDicom([f]); }} disabled={p.busy || !p.inferenceReady} />
+          </label>
         </div>
         {p.vol && (
           <dl className="kv">

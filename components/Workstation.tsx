@@ -12,7 +12,8 @@ import Viewport from './Viewport';
 import type { Analysis, DraftReport, RunRecord } from '@/lib/analysis';
 import { metricsCsv } from '@/lib/csv';
 import { downloadText } from '@/lib/download';
-import { labelsFor, ROLE_COLOR, thresholdMask } from '@/lib/labels';
+import { labelsFor, labelsFromNames, middleSlice, ROLE_COLOR, thresholdMask } from '@/lib/labels';
+import { zip as zipFiles } from 'fflate';
 import { countLabels, readNifti, toMask, toVolume } from '@/lib/nifti';
 import { buildPayload, caseRef, ruleNarrative } from '@/lib/payload';
 import { makePhantom } from '@/lib/phantom';
@@ -135,13 +136,14 @@ export default function Workstation() {
     setResetToken((t) => t + 1);
   }, []);
 
-  const applyMask = useCallback((data: Uint8Array, name: string, source: MaskState['source'], key: SchemeKey) => {
+  const applyMask = useCallback((data: Uint8Array, name: string, source: MaskState['source'], key: SchemeKey, names?: Record<string, string>) => {
     const counts = countLabels(data);
+    const lm = names ? labelsFromNames(counts, names) : labelsFor(counts, key);
     setMask({ data, name, source, counts });
-    setLabels(labelsFor(counts, key));
+    setLabels(lm);
     if (key !== 'threshold') setScheme(key);
-    const present = [...counts.keys()].filter((L) => L && counts[L]).length;
-    log('INFO', 'MASK', `${name}: ${present} labels (${source}, ${key} scheme)`);
+    log('INFO', 'MASK', `${name}: ${Object.values(lm).map((d) => d.name).join(', ')} (${source}${names ? ', names from server' : `, ${key} scheme`})`);
+    return lm;
   }, []);
 
   const loadSample = useCallback(() => {
@@ -190,13 +192,25 @@ export default function Workstation() {
   );
 
   const loadMaskBuffer = useCallback(
-    async (input: Blob | ArrayBuffer, name: string, source: MaskState['source'], key: SchemeKey) => {
+    async (input: Blob | ArrayBuffer, name: string, source: MaskState['source'], key: SchemeKey, names?: Record<string, string>) => {
       if (!vol) throw new Error('Open the CT before its mask.');
       const m = toMask(await readNifti(input));
       if (m.nx !== vol.nx || m.ny !== vol.ny || m.nz !== vol.nz) {
         throw new Error(`Mask grid ${m.nx}×${m.ny}×${m.nz} does not match CT ${vol.nx}×${vol.ny}×${vol.nz}. Resample the mask to the CT grid.`);
       }
-      applyMask(m.data, name, source, key);
+      const lm = applyMask(m.data, name, source, key, names);
+      // Automatic L3: if the segmentation includes the L3 vertebra, use the middle of it.
+      const l3Label = Object.entries(lm).find(([, d]) => d.name === 'L3 vertebra')?.[0];
+      if (l3Label) {
+        const k = middleSlice(m.data, vol.nx * vol.ny, vol.nz, +l3Label);
+        if (k != null) {
+          setL3(k);
+          setCur((c) => ({ ...c, k }));
+          log('INFO', 'L3', `L3 set automatically at axial slice ${k + 1} (middle of the segmented L3 vertebra). Check it before reporting.`);
+          return k;
+        }
+      }
+      return null;
     },
     [vol, applyMask],
   );
@@ -250,6 +264,60 @@ export default function Workstation() {
     [loadCT],
   );
 
+  /** DICOM folder or .zip → the inference server converts one series to NIfTI → opened like any CT. */
+  const openDicom = useCallback(
+    async (files: File[]) => {
+      if (!files.length) return;
+      const t0 = performance.now();
+      try {
+        setBusy(true);
+        let body: Blob;
+        let label: string;
+        if (files.length === 1 && /\.zip$/i.test(files[0].name)) {
+          body = files[0];
+          label = files[0].name.replace(/\.zip$/i, '');
+        } else {
+          setStatus({ text: `Packing ${files.length} DICOM files…` });
+          const entries: Record<string, Uint8Array> = {};
+          let total = 0;
+          for (const f of files) {
+            if (/^\.|DICOMDIR$|\.(txt|xml|json|jpg|png|pdf|exe|inf|ini|html?)$/i.test(f.name)) continue;
+            // keep the folder layout; only make names unique
+            let path = ((f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name).replace(/[^\w.\-/]/g, '_');
+            for (let n = 1; path in entries; n++) path = `${path}_${n}`;
+            entries[path] = new Uint8Array(await f.arrayBuffer());
+            total += f.size;
+          }
+          if (!Object.keys(entries).length) throw new Error('No DICOM files in that folder.');
+          // store without compression: DICOM pixel data barely compresses and this keeps it fast
+          body = new Blob([await new Promise<Uint8Array>((res, rej) => zipFiles(entries, { level: 0 }, (e, d) => (e ? rej(e) : res(d))))], { type: 'application/zip' });
+          const first = (files[0] as File & { webkitRelativePath?: string }).webkitRelativePath || '';
+          label = first.split('/')[0] || 'dicom_series';
+          log('INFO', 'DICOM', `${Object.keys(entries).length} files (${(total / 1e6).toFixed(1)} MB) packed in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+        }
+        setStatus({ text: 'Converting DICOM on the inference server…' });
+        const r = await fetch('/api/convert', { method: 'POST', headers: { 'Content-Type': 'application/zip' }, body });
+        if (!r.ok) throw new Error(await errorText(r));
+        let info = '';
+        try {
+          const list = JSON.parse(decodeURIComponent(r.headers.get('x-series') || '[]')) as { id: string; slices: number; description: string; modality: string }[];
+          const chosen = list.find((x) => x.id === r.headers.get('x-series-chosen'));
+          info = chosen ? `${chosen.modality || 'series'} "${chosen.description || 'no description'}", ${chosen.slices} slices` : '';
+          if (list.length > 1) log('INFO', 'DICOM', `${list.length} series found; opened the largest CT series. Others: ${list.filter((x) => x !== chosen).map((x) => `${x.description || x.id} (${x.slices})`).join('; ')}`);
+        } catch {}
+        const nii = new File([await r.blob()], `${label.replace(/[^\w.\-]/g, '_')}.nii.gz`);
+        log('SUCCESS', 'DICOM', `converted ${info} in ${((performance.now() - t0) / 1000).toFixed(1)} s; patient metadata not carried over`);
+        setBusy(false);
+        await loadCT(nii);
+      } catch (err) {
+        setStatus({ text: (err as Error).message, error: true });
+        log('ERROR', 'DICOM', (err as Error).message);
+        setBusy(false);
+      }
+    },
+    [loadCT],
+  );
+
   const fetchRun = useCallback(async (id: string) => {
     try {
       const r = await fetch(`/api/runs/${id}`, { cache: 'no-store' });
@@ -283,7 +351,20 @@ export default function Workstation() {
       setStatus({ text: 'Reading returned mask…' });
       const returned = res.headers.get('x-label-scheme');
       const key: SchemeKey = returned === 'totalseg' || returned === 'generic' ? returned : scheme;
-      await loadMaskBuffer(await res.arrayBuffer(), `${ctName.replace(/\.nii(\.gz)?$/i, '')}_seg.nii.gz`, 'inference', key);
+      let names: Record<string, string> | undefined;
+      try {
+        const h = res.headers.get('x-labels');
+        if (h) names = JSON.parse(decodeURIComponent(h)) as Record<string, string>;
+      } catch {}
+      const autoL3 = await loadMaskBuffer(await res.arrayBuffer(), `${ctName.replace(/\.nii(\.gz)?$/i, '')}_seg.nii.gz`, 'inference', key, names);
+      if (autoL3 != null) {
+        setReport(null);
+        setSignature(null);
+        setStatus({ text: `Segmentation complete. L3 set automatically at slice ${autoL3 + 1}; please confirm it.` });
+        log('SUCCESS', 'INFERENCE', `mask received in ${((performance.now() - t0) / 1000).toFixed(1)} s${runId ? ` (run ${runId})` : ''}`);
+        if (runId) void fetchRun(runId);
+        return;
+      }
       setReport(null);
       setSignature(null);
       setStatus({ text: 'Segmentation complete. Check the mask before setting L3.' });
@@ -507,6 +588,7 @@ export default function Workstation() {
         reportBusy={reportBusy}
         onOpenCase={openCase}
         onOpenCT={loadCT}
+        onOpenDicom={openDicom}
         onOpenMask={loadMask}
         onSample={loadSample}
         onSegment={runSegmentation}

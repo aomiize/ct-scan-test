@@ -91,3 +91,53 @@ export function thresholdMask(data: Int16Array) {
   }
   return m;
 }
+
+/** Known label names (TotalSegmentator and others) → display name and role. */
+const NAME_ROLES: [RegExp, string, Role][] = [
+  [/^subcutaneous_fat$/i, 'Subcutaneous fat', 'sat'],
+  [/^torso_fat$/i, 'Torso fat (VAT proxy)', 'vat'],
+  [/^(visceral_fat|vat)$/i, 'Visceral fat', 'vat'],
+  [/^(skeletal_muscle|muscle)$/i, 'Skeletal muscle', 'muscle'],
+  [/^(intermuscular_fat|imat)$/i, 'Intermuscular fat', 'imat'],
+  [/^vertebrae_L3$/i, 'L3 vertebra', 'bone'],
+  [/^vertebrae_/i, '', 'bone'],
+  [/^muscle_hu_range$/i, 'Muscle-range HU (demo)', 'muscle'],
+  [/^fat_hu_range$/i, 'Fat-range HU (demo)', 'vat'],
+];
+
+/** Labels from names sent by the segmentation server, so numbering never has to be guessed. */
+export function labelsFromNames(counts: Float64Array, names: Record<string, string>): LabelMap {
+  const out: LabelMap = {};
+  let e = 0;
+  for (let L = 1; L < 256; L++) {
+    if (!counts[L]) continue;
+    const raw = names[String(L)];
+    const hit = raw ? NAME_ROLES.find(([re]) => re.test(raw)) : undefined;
+    const role: Role = hit ? hit[2] : 'other';
+    const name = hit?.[1] || (raw ? raw.replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase()) : `Label ${L}`);
+    out[L] = {
+      name,
+      role,
+      color: hit ? ROLE_COLOR[role] : EXTRA[e++ % EXTRA.length],
+      // the L3 vertebra is a landmark: keep it visible so the level can be checked
+      visible: role !== 'bone' || /L3/i.test(name),
+    };
+  }
+  return out;
+}
+
+/** Middle axial slice of a label in a reoriented mask (k = superior axis), or null if absent. */
+export function middleSlice(mask: Uint8Array, plane: number, nz: number, label: number): number | null {
+  let lo = -1, hi = -1;
+  for (let k = 0; k < nz; k++) {
+    const base = k * plane;
+    for (let p = 0; p < plane; p++) {
+      if (mask[base + p] === label) {
+        if (lo < 0) lo = k;
+        hi = k;
+        break;
+      }
+    }
+  }
+  return lo < 0 ? null : Math.round((lo + hi) / 2);
+}

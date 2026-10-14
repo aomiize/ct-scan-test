@@ -3,6 +3,7 @@ uvicorn>=0.29
 nibabel>=5.2
 numpy>=1.26
 # Add one of these for real models:
-# TotalSegmentator>=2.4
+TotalSegmentator>=2.4   # remove if you only use MODEL=nnunet or demo
 # nnunetv2>=2.5
 psutil>=5.9
+SimpleITK>=2.3   # DICOM → NIfTI conversion

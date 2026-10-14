@@ -33,7 +33,10 @@ browser ──► Next.js (this app) ──► inference/server.py  (segmentatio
                                └─► DATA_DIR             (signed reports, signing key)   CASES_DIR (case library)
 ```
 
-### Segmentation server
+### Segmentation server (GPU machine)
+
+Step-by-step setup with TotalSegmentator: **`inference/README-GPU.md`**. The server also converts DICOM (folder or .zip) to NIfTI without patient metadata, and finds the L3 vertebra so the L3 slice is set automatically.
+
 
 ```bash
 cd inference
@@ -88,7 +91,7 @@ All API routes write one JSON audit line per action to stdout (case open, segmen
 
 ## Not included
 
-- DICOM input (convert with `dcm2niix`) and DICOM SR export / PACS push.
+- PACS query/retrieve (DICOM folder and .zip upload are supported) and DICOM SR export.
 - Built-in login and roles: use the hospital SSO proxy.
 - A database: signed reports are JSON files in `DATA_DIR`.
 - Local validation of the segmentation model, the LLM prompt and the cut-offs.

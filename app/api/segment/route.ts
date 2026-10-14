@@ -56,6 +56,7 @@ export async function POST(req: NextRequest) {
         'Cache-Control': 'no-store',
         'X-Label-Scheme': upstream.headers.get('x-label-scheme') || process.env.INFERENCE_SCHEME || 'generic',
         'X-Run-Id': upstream.headers.get('x-run-id') || '',
+        'X-Labels': upstream.headers.get('x-labels') || '',
       },
     });
   } catch (err) {

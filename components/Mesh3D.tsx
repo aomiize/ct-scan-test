@@ -43,7 +43,8 @@ function buildMeshes(vol: Volume, mask: Uint8Array, labels: LabelMap) {
   // Most body-composition masks have no bone label. Then take bone from the CT itself:
   // the highest HU in each block ≥ BONE_HU, kept only inside the body outline and in connected pieces big enough
   // to be skeleton (drops contrast specks and calcifications). The table sits outside the outline.
-  const hasBone = Object.values(labels).some((d) => d.role === 'bone');
+  // A lone L3-vertebra landmark is not a skeleton, so it does not stop the CT-based bone.
+  const hasBone = Object.values(labels).some((d) => d.role === 'bone' && d.name !== 'L3 vertebra');
   let boneDs: Uint8Array | null = null;
   if (!hasBone) {
     boneDs = new Uint8Array(dx * dy * dz);

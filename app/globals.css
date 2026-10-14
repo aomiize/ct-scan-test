@@ -372,3 +372,4 @@ pre.code { margin: 0; max-height: 420px; overflow: auto; background: var(--term-
   .rc-val { font-size: 18px; }
   .panel, .riskcard, .prov > div { break-inside: avoid; border-color: #bbb; }
 }
+.btn.off { opacity: 0.45; cursor: not-allowed; }
