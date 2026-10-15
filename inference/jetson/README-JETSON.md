@@ -1,8 +1,30 @@
 # Segmentation server on a Jetson AGX Xavier (JetPack 5)
 
+Two ways to install. Both give the same server.
+
+| | Disk needed | Notes |
+|---|---|---|
+| **A. Native (recommended on 32 GB eMMC)** | ~4–5 GB | `./jetson/install-native.sh`. Everything in `~/bodycomp-venv`; GPU stats via tegrastats work directly. |
+| **B. Docker** | ~12 GB | `./jetson/run.sh`. Fully isolated, but the base image alone is 5.4 GB. |
+
+## A. Native install (no Docker)
+
+```bash
+cd inference
+chmod +x jetson/install-native.sh
+./jetson/install-native.sh
+~/bodycomp-venv/bin/totalseg_set_license -l aca_YOURNUMBER
+MODEL=totalseg API_KEY=change-me TOTALSEG_THREADS=2 ~/bodycomp-venv/bin/python -m uvicorn server:app --host 0.0.0.0 --port 8000
+```
+
+The script prints `GPU available: True` at the end if PyTorch sees the Xavier's GPU. Model weights (~1–2 GB) download on the
+first segmentation into `~/.totalsegmentator`.
+
+## B. Docker
+
 Everything runs in Docker, so nothing changes in the Jetson's own Python 3.8.
 
-## 1. Build and start (once, about 20–40 minutes the first time)
+### 1. Build and start (once, about 20–40 minutes the first time)
 
 ```bash
 cd inference
@@ -16,7 +38,7 @@ curl http://localhost:8000/health
 docker exec bodycomp-seg python3 -c "import torch; print(torch.cuda.is_available())"   # must print True
 ```
 
-## 2. TotalSegmentator licence (for tissue_types)
+### 2. TotalSegmentator licence (for tissue_types)
 
 Request the free academic licence on the TotalSegmentator GitHub page, then (replace ABC123 with your key, no angle brackets):
 
@@ -26,7 +48,7 @@ docker exec bodycomp-seg totalseg_set_license -l ABC123
 
 The licence and the model weights are kept in the `totalseg-data` Docker volume, so this is done once.
 
-## 3. First test inside the container
+### 3. First test inside the container
 
 Copy one CT in and run TotalSegmentator directly. The first run downloads the weights (needs internet):
 
