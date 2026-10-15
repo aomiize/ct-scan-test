@@ -35,7 +35,9 @@ browser ──► Next.js (this app) ──► inference/server.py  (segmentatio
 
 ### Segmentation server (GPU machine)
 
-Step-by-step setup with TotalSegmentator: **`inference/README-GPU.md`**. The server also converts DICOM (folder or .zip) to NIfTI without patient metadata, and finds the L3 vertebra so the L3 slice is set automatically.
+Step-by-step setup: **`inference/README-GPU.md`** (normal GPU machine) or **`inference/jetson/README-JETSON.md`** (Jetson, JetPack 5).
+Supported models: the Mazurowski-lab muscle/fat nnU-Net (muscle, SAT, VAT, intermuscular fat; no licence), TotalSegmentator
+`tissue_types` (licence), or any nnU-Net v2 model folder; label names are read from its `dataset.json`. The server also converts DICOM (folder or .zip) to NIfTI without patient metadata, and finds the L3 vertebra so the L3 slice is set automatically.
 
 
 ```bash

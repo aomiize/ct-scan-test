@@ -18,7 +18,10 @@ MODEL (env var) picks the backend:
             AUTO_L3=1 (default) also runs the free "total" model on vertebrae_L3 and adds it as label 50,
             so the viewer can set the L3 slice by itself. TOTALSEG_FAST=1 uses the faster 3 mm models.
             TOTALSEG_THREADS=1 lowers memory use (fewer worker processes).
-  nnunet    nnUNetv2_predict with NNUNET_DATASET / NNUNET_CONFIG / NNUNET_FOLDS
+  nnunet    nnU-Net v2. Either a model folder you downloaded (NNUNET_MODEL_FOLDER, NNUNET_FOLDS, NNUNET_CHECKPOINT)
+            or a dataset in nnUNet_results (NNUNET_DATASET / NNUNET_CONFIG / NNUNET_FOLDS).
+            Label names come from the model folder's dataset.json. AUTO_L3 also applies if TotalSegmentator is installed.
+            NNUNET_THREADS=1 lowers memory use; NNUNET_DEVICE=cpu forces CPU.
             (your own model; set LABEL_SCHEME=generic or totalseg to match its label numbers)
   demo      HU thresholds only (generic labels: 1 muscle-range, 3 fat-range). Pipeline test only.
 
@@ -375,6 +378,21 @@ def totalseg_labels(task: str) -> dict[int, str]:
         return {1: "subcutaneous_fat", 2: "torso_fat", 3: "skeletal_muscle"} if task == "tissue_types" else {}
 
 
+def nnunet_labels(folder: str) -> dict[int, str] | None:
+    """Label number → name from the model folder's dataset.json ({"labels": {"background": 0, "muscle": 1, …}})."""
+    try:
+        labels = json.loads((Path(folder) / "dataset.json").read_text())["labels"]
+        out: dict[int, str] = {}
+        for name, value in labels.items():
+            if isinstance(value, (list, tuple)):  # region-based training: skip regions
+                continue
+            if int(value) > 0:
+                out[int(value)] = str(name)
+        return out or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def merge_l3(run: Run, tissue: Path, l3: Path) -> None:
     """Write the L3 vertebra into the tissue mask as label 50 (bone does not overlap the soft-tissue labels)."""
     import nibabel as nib
@@ -421,16 +439,43 @@ def run_model(run: Run, ct: Path, work: Path) -> tuple[Path, dict[int, str] | No
         with run.stage("preprocess"):
             inp.mkdir()
             ct.rename(inp / ("case_0000.nii.gz" if ct.name.endswith(".gz") else "case_0000.nii"))
-        cmd = ["nnUNetv2_predict", "-i", str(inp), "-o", str(outdir),
-               "-d", os.environ["NNUNET_DATASET"], "-c", os.environ.get("NNUNET_CONFIG", "3d_fullres")]
-        if folds := os.environ.get("NNUNET_FOLDS"):
-            cmd += ["-f", *folds.split()]
+        folder = os.environ.get("NNUNET_MODEL_FOLDER", "")
+        if folder:
+            # A trained model folder copied as-is (plans.json, dataset.json, fold_X/checkpoint_*.pth),
+            # e.g. the Mazurowski-lab muscle/fat model "nnUNetTrainer__nnUNetResEncUNetXLPlans__2d".
+            cmd = ["nnUNetv2_predict_from_modelfolder", "-i", str(inp), "-o", str(outdir), "-m", folder,
+                   "-f", *os.environ.get("NNUNET_FOLDS", "0").split(),
+                   "-chk", os.environ.get("NNUNET_CHECKPOINT", "checkpoint_final.pth")]
+        else:
+            cmd = ["nnUNetv2_predict", "-i", str(inp), "-o", str(outdir),
+                   "-d", os.environ["NNUNET_DATASET"], "-c", os.environ.get("NNUNET_CONFIG", "3d_fullres")]
+            if folds := os.environ.get("NNUNET_FOLDS"):
+                cmd += ["-f", *folds.split()]
+        if os.environ.get("NNUNET_DEVICE"):
+            cmd += ["-device", os.environ["NNUNET_DEVICE"]]
+        if os.environ.get("NNUNET_THREADS"):  # fewer worker processes = less memory
+            cmd += ["-npp", os.environ["NNUNET_THREADS"], "-nps", os.environ["NNUNET_THREADS"]]
         with run.stage("inference"):
             stream_cmd(run, cmd, "NNUNET")
         found = sorted(outdir.glob("case.nii*"))
         if not found:
             raise RuntimeError("nnU-Net produced no output file.")
-        return found[0], None
+        out = found[0]
+        labels = nnunet_labels(folder) if folder else None
+        if AUTO_L3 and shutil.which("TotalSegmentator"):
+            try:
+                l3 = work / "l3.nii.gz"
+                fast = ["--fast"] if TOTALSEG_FAST else []
+                if TOTALSEG_THREADS:
+                    fast += ["-nr", TOTALSEG_THREADS, "-ns", TOTALSEG_THREADS]
+                with run.stage("l3_detection"):
+                    stream_cmd(run, ["TotalSegmentator", "-i", str(next(inp.iterdir())), "-o", str(l3),
+                                     "--roi_subset", "vertebrae_L3", "--ml", *fast], "TOTALSEG-L3")
+                merge_l3(run, out, l3)
+                labels = {**(labels or {}), L3_LABEL: "vertebrae_L3"}
+            except Exception as e:  # noqa: BLE001
+                run.log("WARN", "L3", f"automatic L3 detection failed, set it by hand: {str(e)[-200:]}")
+        return out, labels
 
     if MODEL == "demo":
         import nibabel as nib

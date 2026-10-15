@@ -94,15 +94,16 @@ export function thresholdMask(data: Int16Array) {
 
 /** Known label names (TotalSegmentator and others) → display name and role. */
 const NAME_ROLES: [RegExp, string, Role][] = [
-  [/^subcutaneous_fat$/i, 'Subcutaneous fat', 'sat'],
-  [/^torso_fat$/i, 'Torso fat (VAT proxy)', 'vat'],
-  [/^(visceral_fat|vat)$/i, 'Visceral fat', 'vat'],
-  [/^(skeletal_muscle|muscle)$/i, 'Skeletal muscle', 'muscle'],
-  [/^(intermuscular_fat|imat)$/i, 'Intermuscular fat', 'imat'],
-  [/^vertebrae_L3$/i, 'L3 vertebra', 'bone'],
-  [/^vertebrae_/i, '', 'bone'],
-  [/^muscle_hu_range$/i, 'Muscle-range HU (demo)', 'muscle'],
-  [/^fat_hu_range$/i, 'Fat-range HU (demo)', 'vat'],
+  // names are normalised first: lower case, spaces and hyphens → "_"
+  [/^torso_fat$/, 'Torso fat (VAT proxy)', 'vat'],
+  [/^(sat|s_?fat|subcutaneous(_adipose)?(_fat|_tissue)?)$/, 'Subcutaneous fat', 'sat'],
+  [/^(vat|v_?fat|visceral(_adipose)?(_fat|_tissue)?)$/, 'Visceral fat', 'vat'],
+  [/^(imat|m_?fat|muscular_fat|intra_?muscular(_adipose)?(_fat|_tissue)?|inter_?muscular(_adipose)?(_fat|_tissue)?)$/, 'Intermuscular fat', 'imat'],
+  [/^(skeletal_)?muscles?$/, 'Skeletal muscle', 'muscle'],
+  [/^vertebrae_l3$/, 'L3 vertebra', 'bone'],
+  [/^vertebrae_/, '', 'bone'],
+  [/^muscle_hu_range$/, 'Muscle-range HU (demo)', 'muscle'],
+  [/^fat_hu_range$/, 'Fat-range HU (demo)', 'vat'],
 ];
 
 /** Labels from names sent by the segmentation server, so numbering never has to be guessed. */
@@ -112,7 +113,8 @@ export function labelsFromNames(counts: Float64Array, names: Record<string, stri
   for (let L = 1; L < 256; L++) {
     if (!counts[L]) continue;
     const raw = names[String(L)];
-    const hit = raw ? NAME_ROLES.find(([re]) => re.test(raw)) : undefined;
+    const key = raw?.trim().toLowerCase().replace(/[\s-]+/g, '_');
+    const hit = key ? NAME_ROLES.find(([re]) => re.test(key)) : undefined;
     const role: Role = hit ? hit[2] : 'other';
     const name = hit?.[1] || (raw ? raw.replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase()) : `Label ${L}`);
     out[L] = {

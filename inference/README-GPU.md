@@ -7,6 +7,19 @@ The GPU machine runs `server.py`. It does two jobs for the web app:
 - **DICOM → NIfTI**: the app uploads a DICOM folder or .zip; the server picks the CT series with the most slices and converts it. Names, IDs and dates do not survive the conversion.
 - **Segmentation**: TotalSegmentator `tissue_types` (subcutaneous fat, torso fat, skeletal muscle), plus `vertebrae_L3` so the app sets the L3 slice automatically.
 
+## Using the Mazurowski-lab muscle/fat model instead of TotalSegmentator
+
+On a normal GPU machine (Python 3.9+), install `nnunetv2>=2.5.1` and `TotalSegmentator>=2.6` (for automatic L3), download the
+model folder `nnUNetTrainer__nnUNetResEncUNetXLPlans__2d` from the
+[repo's Google Drive link](https://github.com/mazurowski-lab/CT-Muscle-and-Fat-Segmentation), then:
+
+```bash
+MODEL=nnunet NNUNET_MODEL_FOLDER=/path/to/nnUNetTrainer__nnUNetResEncUNetXLPlans__2d NNUNET_FOLDS=5 \
+API_KEY=change-me $PY -m uvicorn server:app --host 0.0.0.0 --port 8000
+```
+
+Labels 1 muscle, 2 SAT, 3 VAT, 4 intermuscular fat. Weights are CC BY-NC 4.0 (cite arXiv:2502.09779).
+
 ## 1. Install (once)
 
 Install the server into the **same Python that already runs TotalSegmentator**. Find it first:

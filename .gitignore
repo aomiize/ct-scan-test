@@ -6,3 +6,4 @@ node_modules
 *.nii.gz
 __pycache__
 data/
+*.tsbuildinfo

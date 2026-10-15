@@ -4,7 +4,7 @@ Two ways to install. Both give the same server.
 
 | | Disk needed | Notes |
 |---|---|---|
-| **A. Native (recommended on 32 GB eMMC)** | ~4–5 GB | `./jetson/install-native.sh`. Everything in `~/bodycomp-venv`; GPU stats via tegrastats work directly. |
+| **A. Native (recommended on 32 GB eMMC)** | ~4–5 GB + model weights | `./jetson/install-native.sh`. Everything in `~/bodycomp-venv`; GPU stats via tegrastats work directly. |
 | **B. Docker** | ~12 GB | `./jetson/run.sh`. Fully isolated, but the base image alone is 5.4 GB. |
 
 ## A. Native install (no Docker)
@@ -17,8 +17,43 @@ chmod +x jetson/install-native.sh
 MODEL=totalseg API_KEY=change-me TOTALSEG_THREADS=2 ~/bodycomp-venv/bin/python -m uvicorn server:app --host 0.0.0.0 --port 8000
 ```
 
-The script prints `GPU available: True` at the end if PyTorch sees the Xavier's GPU. Model weights (~1–2 GB) download on the
-first segmentation into `~/.totalsegmentator`.
+The script prints `GPU available: True` at the end if PyTorch sees the Xavier's GPU. It installs nnU-Net 2.5.1 and
+TotalSegmentator 2.6 (with small Python 3.8 fixes from `patch_py38.py`), so it can run either model below.
+
+### Model option 1: Mazurowski-lab muscle/fat model (recommended, no licence)
+
+[CT-Muscle-and-Fat-Segmentation](https://github.com/mazurowski-lab/CT-Muscle-and-Fat-Segmentation): nnU-Net v2, 2D ResEnc-XL.
+Labels **1 skeletal muscle, 2 subcutaneous fat, 3 visceral fat, 4 intermuscular fat**, which are the app's generic labels.
+It has real VAT, not the "torso fat" proxy of TotalSegmentator.
+
+1. From the repo's Google Drive folder, download the folder **`nnUNetTrainer__nnUNetResEncUNetXLPlans__2d`**. It must contain
+   `plans.json`, `dataset.json` and `fold_5/checkpoint_final.pth` (the repo uses fold 5).
+2. Copy it to the Xavier, e.g. `~/models/nnUNetTrainer__nnUNetResEncUNetXLPlans__2d/`.
+3. Start the server:
+
+```bash
+cd inference
+MODEL=nnunet \
+NNUNET_MODEL_FOLDER=$HOME/models/nnUNetTrainer__nnUNetResEncUNetXLPlans__2d \
+NNUNET_FOLDS=5 NNUNET_CHECKPOINT=checkpoint_final.pth \
+AUTO_L3=1 TOTALSEG_FAST=1 API_KEY=change-me \
+~/bodycomp-venv/bin/python -m uvicorn server:app --host 0.0.0.0 --port 8000
+```
+
+`AUTO_L3=1` runs TotalSegmentator's free `vertebrae_L3` model after the tissue model, so the app sets the L3 slice itself.
+If memory runs short, add `NNUNET_THREADS=1 TOTALSEG_THREADS=1`.
+
+Licence: the weights are **CC BY-NC 4.0** (non-commercial; credit required). Cite: Chen Y, et al. *Automated Muscle and Fat
+Segmentation in Computed Tomography for Comprehensive Body Composition Analysis.* arXiv:2502.09779 (2025).
+
+### Model option 2: TotalSegmentator tissue_types (needs a free academic licence)
+
+```bash
+~/bodycomp-venv/bin/totalseg_set_license -l aca_YOURNUMBER
+MODEL=totalseg API_KEY=change-me TOTALSEG_THREADS=2 ~/bodycomp-venv/bin/python -m uvicorn server:app --host 0.0.0.0 --port 8000
+```
+
+TotalSegmentator weights (~1–2 GB) download on the first run into `~/.totalsegmentator`.
 
 ## B. Docker
 
@@ -61,8 +96,9 @@ docker exec bodycomp-seg TotalSegmentator -i /tmp/ct.nii.gz -o /tmp/l3.nii.gz --
 If it is too slow or runs out of memory (`docker logs` shows the process was killed), add to the `docker run` line in `run.sh`:
 `-e TOTALSEG_FAST=1` (3 mm models, much faster and lighter) and/or `-e TOTALSEG_THREADS=1` (fewer worker processes), then run `./jetson/run.sh` again.
 
-Tested: TotalSegmentator 2.0.5 + nnU-Net 2.1 installed from these exact pins on Python 3.8 run correctly
-(vertebrae_L3 on a 512×512×53 CT took 27 s on a 2-core CPU with `--fast`).
+Tested on Python 3.8 (torch 2.1) from these exact pins: TotalSegmentator 2.6 found L3 on a 512×512×53 CT (27 s on a
+2-core CPU, `--fast`), and the server's `MODEL=nnunet` model-folder path ran inference, read label names from
+`dataset.json` and merged the automatic L3. Not yet run on Jetson hardware itself.
 
 ## 4. Connect the web app
 
@@ -81,5 +117,5 @@ INFERENCE_API_KEY=change-me
   or use `totalseg_import_weights`.
 - **Device status shows no GPU numbers:** the `tegrastats` mount is missing; check the `-v /usr/bin/tegrastats` line.
 - **Run hangs with no CPU use:** a worker process was killed for memory and the main process waits forever. Use `TOTALSEG_THREADS=1` and check `free -h`.
-- **Why TotalSegmentator 2.0.5:** it is the newest release whose code runs on Python 3.8, and it includes
-  `tissue_types` (subcutaneous fat, torso fat, skeletal muscle) and `vertebrae_L3`, with the same label numbers the app expects.
+- **Why these versions:** JetPack 5 only has GPU PyTorch for Python 3.8. nnU-Net 2.5.1 (needed for the ResEnc models) and
+  TotalSegmentator 2.6 declare Python 3.9+, but their code needs only the small type-hint fixes in `patch_py38.py`.

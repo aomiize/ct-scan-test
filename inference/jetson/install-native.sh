@@ -7,10 +7,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 VENV="${VENV:-$HOME/bodycomp-venv}"
-# NVIDIA's GPU build of PyTorch for JetPack 5.1.x / Python 3.8 (from NVIDIA's "Installing PyTorch for Jetson" page)
-TORCH_WHL="torch-2.0.0+nv23.05-cp38-cp38-linux_aarch64.whl"
-TORCH_URLS=("https://developer.download.nvidia.com/compute/redist/jp/v511/pytorch/$TORCH_WHL"
-            "https://developer.download.nvidia.cn/compute/redist/jp/v511/pytorch/$TORCH_WHL")
+# NVIDIA's GPU builds of PyTorch for Python 3.8: 2.1 for JetPack 5.1.2+ (preferred), 2.0 for JetPack 5.1.1 as fallback.
+TORCH_URLS=("https://developer.download.nvidia.com/compute/redist/jp/v512/pytorch/torch-2.1.0a0+41361538.nv23.06-cp38-cp38-linux_aarch64.whl"
+            "https://developer.download.nvidia.com/compute/redist/jp/v511/pytorch/torch-2.0.0+nv23.05-cp38-cp38-linux_aarch64.whl"
+            "https://developer.download.nvidia.cn/compute/redist/jp/v511/pytorch/torch-2.0.0+nv23.05-cp38-cp38-linux_aarch64.whl")
 
 echo "== Free space before:"; df -h / | tail -1
 sudo apt-get update -y
@@ -26,25 +26,30 @@ ok=0
 for u in "${TORCH_URLS[@]}"; do
   if python -m pip install --no-cache-dir "$u"; then ok=1; break; fi
 done
-[ "$ok" = 1 ] || { echo "Could not download $TORCH_WHL. Check internet access, then rerun."; exit 1; }
+[ "$ok" = 1 ] || { echo "Could not download NVIDIA's PyTorch wheel. Check internet access, then rerun."; exit 1; }
 
 echo "== Installing pinned packages (Python 3.8 versions; --no-deps keeps NVIDIA's PyTorch)"
 grep -vE '^\s*(#|$)' jetson/requirements-jetson.txt | sed 's/\s*#.*$//' > /tmp/bodycomp-req.txt
 python -m pip install --no-cache-dir --no-deps -r /tmp/bodycomp-req.txt
-python -m pip install --no-cache-dir --no-deps --ignore-requires-python "nnunetv2==2.1" "TotalSegmentator==2.0.5"
-python jetson/patch_totalseg.py
+python -m pip install --no-cache-dir --no-deps --ignore-requires-python \
+  "batchgeneratorsv2==0.2.1" "nnunetv2==2.5.1" "TotalSegmentator==2.6.0"
+python jetson/patch_py38.py
 
 echo "== Checks"
 python -c "import torch; print('torch', torch.__version__, '| GPU available:', torch.cuda.is_available())"
-python -c "import nnunetv2, totalsegmentator.nnunet, SimpleITK, fastapi; print('nnU-Net, TotalSegmentator, SimpleITK, FastAPI: OK')"
+python -c "from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor; from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer; import totalsegmentator.nnunet, SimpleITK, fastapi; print('nnU-Net 2.5.1, TotalSegmentator 2.6, SimpleITK, FastAPI: OK')"
 TotalSegmentator --version
 echo "== Free space after:"; df -h / | tail -1
 
 cat <<MSG
 
 Installed in $VENV.
-1) Licence (for tissue_types):   $VENV/bin/totalseg_set_license -l aca_YOURNUMBER
-2) Start the server:
-   cd $(pwd)
+Start the server with ONE of these (from $(pwd)):
+
+ A) Mazurowski-lab muscle/fat model (no licence needed; see jetson/README-JETSON.md for the weights):
+   MODEL=nnunet NNUNET_MODEL_FOLDER=$HOME/models/nnUNetTrainer__nnUNetResEncUNetXLPlans__2d NNUNET_FOLDS=5 \\
+   API_KEY=change-me $VENV/bin/python -m uvicorn server:app --host 0.0.0.0 --port 8000
+
+ B) TotalSegmentator tissue_types (licence: $VENV/bin/totalseg_set_license -l aca_YOURNUMBER):
    MODEL=totalseg API_KEY=change-me TOTALSEG_THREADS=2 $VENV/bin/python -m uvicorn server:app --host 0.0.0.0 --port 8000
 MSG
