@@ -74,6 +74,29 @@ KEEP_RUNS = 50
 app = FastAPI(title="BodyComp segmentation")
 
 
+def resolve_model_folder(path: str) -> str:
+    """Return the model folder, forgiving a lost "__" (chat apps often eat double underscores when a command is
+    copied). Prints a clear message at startup instead of failing on the first run."""
+    if not path:
+        return path
+    p = Path(path).expanduser()
+    if (p / "dataset.json").exists():
+        return str(p)
+    key = re.sub(r"_", "", p.name).lower()
+    if p.parent.is_dir():
+        for c in p.parent.iterdir():
+            if c.is_dir() and re.sub(r"_", "", c.name).lower() == key and (c / "dataset.json").exists():
+                print(f"NNUNET_MODEL_FOLDER {p} not found; using {c}", flush=True)
+                return str(c)
+    print(f"WARNING: NNUNET_MODEL_FOLDER {p} has no dataset.json. Check the folder name "
+          f"(it contains double underscores: nnUNetTrainer__<Plans>__<config>).", flush=True)
+    return str(p)
+
+
+if os.environ.get("NNUNET_MODEL_FOLDER"):
+    os.environ["NNUNET_MODEL_FOLDER"] = resolve_model_folder(os.environ["NNUNET_MODEL_FOLDER"])
+
+
 # ---------------------------------------------------------------- resources
 class Sampler:
     """Reads GPU/CPU state. One shared tegrastats process on Jetson; nvidia-smi or psutil elsewhere."""
@@ -366,7 +389,14 @@ async def convert(request: Request, x_api_key: str = Header(""), x_series_id: st
 
 
 def stream_cmd(run: Run, cmd: list[str], tag: str) -> None:
-    """Run a command and copy its output into the run log line by line."""
+    """Run a command and copy its output into the run log line by line.
+
+    Tools (nnUNetv2_*, TotalSegmentator) are taken from the same environment as this server's Python, so an
+    activated conda/venv in the terminal cannot swap in a different installation."""
+    import sys
+    own = Path(sys.executable).parent / cmd[0]
+    if own.exists():
+        cmd = [str(own), *cmd[1:]]
     run.log("DEBUG", tag, " ".join(cmd))
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     tail: list[str] = []
@@ -499,7 +529,7 @@ def run_model(run: Run, ct: Path, work: Path, tta: bool = False) -> tuple[Path, 
             raise RuntimeError("nnU-Net produced no output file.")
         out = found[0]
         labels = nnunet_labels(folder) if folder else None
-        if AUTO_L3 and shutil.which("TotalSegmentator"):
+        if AUTO_L3 and (shutil.which("TotalSegmentator") or (Path(__import__("sys").executable).parent / "TotalSegmentator").exists()):
             try:
                 labels = {**(labels or {}), **detect_vertebrae(run, next(inp.iterdir()), out, work)}
             except Exception as e:  # noqa: BLE001
