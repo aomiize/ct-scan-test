@@ -1,3 +1,5 @@
+import type { EdgePayload } from './edge';
+
 /** De-identified metrics: the only data sent to the language model. */
 export interface AnalysisPayload {
   schema: 'bodycomp.metrics/v1';
@@ -59,6 +61,8 @@ export interface GeneratedReport {
   fallbackReason?: string;
   request?: unknown;
   rawResponse?: string;
+  /** The eight-field payload exactly as it left the edge device. */
+  transmitted?: EdgePayload;
 }
 
 export interface SignatureResult {

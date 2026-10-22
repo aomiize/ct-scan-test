@@ -29,6 +29,9 @@ It has real VAT, not the "torso fat" proxy of TotalSegmentator.
 1. From the repo's Google Drive folder, download the folder **`nnUNetTrainer__nnUNetResEncUNetXLPlans__2d`**. It must contain
    `plans.json`, `dataset.json` and `fold_5/checkpoint_final.pth` (the repo uses fold 5).
 2. Copy it to the Xavier, e.g. `~/models/nnUNetTrainer__nnUNetResEncUNetXLPlans__2d/`.
+   **Only have the `checkpoint_*.pth` files?** nnU-Net v2 stores plans.json and dataset.json inside the checkpoint, so rebuild the
+   folder (links the checkpoints, no extra space) and it prints the exact start command:
+   `~/bodycomp-venv/bin/python rebuild_model_folder.py ~/backup_weights`
 3. Start the server:
 
 ```bash
@@ -108,6 +111,31 @@ In the web app's `.env.local`:
 INFERENCE_URL=http://<jetson-ip>:8000/segment
 INFERENCE_API_KEY=change-me
 ```
+
+## 5. Speed settings and benchmarking
+
+- **TTA is off by default** (`DISABLE_TTA=1`). nnU-Net's 8-way mirroring test-time augmentation is the single largest
+  slowdown; set `DISABLE_TTA=0` to turn it back on. The Run log tab shows `TTA on/off` for each run.
+- **FP16:** nnU-Net already runs inference in mixed precision (`torch.autocast`) on the GPU; nothing to set.
+- **T12–L4 range:** with `AUTO_L3=1` and TotalSegmentator installed, the server also finds T12 and L4 (labels 51, 52)
+  so the eight transmitted values cover exactly T12–L4. Change the list with `VERTEBRAE="T12 L3 L4"`.
+
+Fix the clocks before every benchmark, otherwise results are not comparable:
+
+```bash
+sudo nvpmodel -q          # shows the current mode
+sudo nvpmodel -m 0        # MAXN on AGX Xavier and Orin NX
+sudo jetson_clocks
+```
+
+Then, with the server running, from the `inference` folder:
+
+```bash
+~/bodycomp-venv/bin/python benchmark.py /path/to/ct.nii.gz --key change-me --runs 3
+```
+
+It runs the same CT with TTA off and on (per-request `X-TTA` header, so no server restart), prints mean inference time,
+total time, peak memory and whether the 5-minute target is met, and saves a CSV for the report.
 
 ## Troubleshooting
 

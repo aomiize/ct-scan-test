@@ -1,10 +1,11 @@
 import { NextRequest } from 'next/server';
+import { hdr, longPost } from '@/lib/server/long-post';
 import { audit, inferenceBase, inferenceHeaders, proxyUser } from '@/lib/server/config';
 
 // DICOM .zip → NIfTI, done on the inference server (SimpleITK). Patient metadata does not survive the conversion.
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-export const maxDuration = 300;
+export const maxDuration = 1800;
 
 export async function POST(req: NextRequest) {
   const base = inferenceBase();
@@ -13,18 +14,18 @@ export async function POST(req: NextRequest) {
   const bytes = Number(req.headers.get('content-length') || 0);
   audit('dicom.convert', { user: proxyUser(req.headers), bytes });
   try {
-    const up = await fetch(`${base}/convert`, {
-      method: 'POST',
-      headers: {
+    const up = await longPost(
+      `${base}/convert`,
+      req.body,
+      {
         'Content-Type': 'application/zip',
+        ...(bytes ? { 'Content-Length': String(bytes) } : {}),
         ...inferenceHeaders(),
         ...(req.headers.get('x-series-id') ? { 'X-Series-Id': req.headers.get('x-series-id')! } : {}),
       },
-      body: req.body,
-      duplex: 'half',
-      signal: AbortSignal.timeout(maxDuration * 1000),
-    } as RequestInit & { duplex: 'half' });
-    if (!up.ok) {
+      maxDuration * 1000,
+    );
+    if (up.status < 200 || up.status >= 300) {
       const t = await up.text();
       let detail = t;
       try { detail = (JSON.parse(t) as { detail?: string }).detail ?? t; } catch {}
@@ -34,8 +35,8 @@ export async function POST(req: NextRequest) {
       headers: {
         'Content-Type': 'application/octet-stream',
         'Cache-Control': 'no-store',
-        'X-Series': up.headers.get('x-series') ?? '',
-        'X-Series-Chosen': up.headers.get('x-series-chosen') ?? '',
+        'X-Series': hdr(up.headers, 'x-series'),
+        'X-Series-Chosen': hdr(up.headers, 'x-series-chosen'),
       },
     });
   } catch (e) {

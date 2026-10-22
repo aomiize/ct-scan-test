@@ -137,16 +137,16 @@ export function ruleNarrative(pl: AnalysisPayload): Narrative {
   };
 }
 
-/** Find numbers in text that do not appear in the payload (tolerating rounding). */
-export function unverifiedNumbers(text: string, pl: AnalysisPayload): string[] {
-  const known: number[] = [];
+/** Find numbers in text that appear in none of the given sources (tolerating rounding). */
+export function unverifiedNumbers(text: string, ...sources: unknown[]): string[] {
+  const known: number[] = [12]; // "T12"
   const walk = (o: unknown) => {
     if (typeof o === 'number') known.push(o);
     else if (Array.isArray(o)) o.forEach(walk);
     else if (o && typeof o === 'object') Object.values(o).forEach(walk);
   };
-  walk(pl);
-  if (pl.l3) known.push(pl.l3.slice_index + 1, 3);
+  sources.forEach(walk);
+  for (const pl of sources as Partial<AnalysisPayload>[]) if (pl?.l3) known.push(pl.l3.slice_index + 1);
   const found = text.match(/-?\d+(?:\.\d+)?/g) ?? [];
   const out = new Set<string>();
   for (const s of found) {

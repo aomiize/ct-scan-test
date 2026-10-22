@@ -48,7 +48,7 @@ export default function RunLog({ a, onRefresh }: { a: Analysis; onRefresh: () =>
         <div className="panel-head">
           <div>
             <h3>Segmentation run</h3>
-            <p>{run ? `${run.filename} · ${run.model} on ${run.device} · started ${run.started}` : 'No server run yet. Open a CT and choose Run segmentation.'}</p>
+            <p>{run ? `${run.filename} · ${run.model} on ${run.device}${run.tta != null ? ` · TTA ${run.tta ? 'on' : 'off'}` : ''} · started ${run.started}` : 'No server run yet. Open a CT and choose Run segmentation.'}</p>
           </div>
           {run && <button type="button" className="btn small" onClick={onRefresh}>Refresh</button>}
         </div>

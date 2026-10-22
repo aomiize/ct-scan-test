@@ -17,7 +17,7 @@ export const llmConfig = () => ({
   model: process.env.LLM_MODEL || 'medgemma-27b',
   apiKey: process.env.LLM_API_KEY || '',
   temperature: Number(process.env.LLM_TEMPERATURE ?? 0.1),
-  timeoutMs: Number(process.env.LLM_TIMEOUT_MS ?? 120000),
+  timeoutMs: Number(process.env.LLM_TIMEOUT_MS ?? 280000),
 });
 
 export const dataDir = () => path.resolve(process.env.DATA_DIR || './data');

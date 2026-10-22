@@ -1,22 +1,62 @@
 import { createHash } from 'node:crypto';
 import { NextRequest } from 'next/server';
+import { deriveIndices, EDGE_FIELD_INFO, EDGE_FIELDS, type EdgePayload, validateEdgePayload } from '@/lib/edge';
 import { unverifiedNumbers } from '@/lib/payload';
-import type { AnalysisPayload, GeneratedReport, Narrative } from '@/lib/report-types';
+import type { GeneratedReport, Narrative } from '@/lib/report-types';
 import { audit, llmConfig, proxyUser } from '@/lib/server/config';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 export const maxDuration = 180;
 
-const SYSTEM = `You draft CT body-composition reports for a radiologist, who will review and sign them.
+const SYSTEM = `You draft CT body-composition reports for a physician, who will review and sign them.
+The data are eight de-identified volumetric measurements of the abdominal segment from vertebra T12 to L4,
+produced by automated segmentation on an edge device, plus indices derived from them. Nothing else is known
+about the patient: no sex, age, height, weight or history.
 Rules:
-- Use only the numbers in the JSON you are given. Never invent, estimate or convert values.
+- Use only the numbers you are given. Never invent, estimate, convert or calculate values; every percentage and ratio
+  you need is already in "Derived indices". Quote each one under its exact name (for example, sfat_share_of_body_pct
+  is the subcutaneous fat share; total_fat_share_of_body_pct is all fat together).
+- Write volumes in cm³, using the values under "Volumes in cm³". Do not write mm³ or "million".
 - If a value is null, say it is not available.
-- A finding is abnormal only if its entry in "references" has flagged=true. Do not apply other cut-offs.
-- Mention every item in "quality_flags" under limitations.
-- Be concise and clinical. No patient identifiers exist in the data; do not make any up.
+- There are no reference ranges for these volumes. Do not call a volume or a share low, normal or high; describe the
+  values and the fat distribution instead.
+- Muscle density: use the "myosteatosis" field as given. Its cut-offs (33 and 41 HU, Martin 2013) come from a single
+  L3 slice, so describe it as an indication, not a diagnosis.
+- Sex- and height-specific cut-offs (such as skeletal muscle index) cannot be applied; say so instead of guessing.
+- A higher visceral/subcutaneous fat ratio means a more central (visceral) fat distribution; do not quote a cut-off for it.
+- Be concise and clinical. Do not mention or make up any patient identifier.
+Write:
+- "summary": two or three sentences with the overall picture.
+- "examination": what was measured (segment, method).
+- "muscle": muscle quantity and quality, and what it suggests for sarcopenia risk.
+- "adipose": fat distribution, and what it suggests for metabolic syndrome risk.
+- "recommendations": short lifestyle guidance and suggested follow-up, as a list.
+- "limitations": what these data cannot show.
 Reply with one JSON object and nothing else:
 {"summary": string, "examination": string, "muscle": string, "adipose": string, "recommendations": string[], "limitations": string}`;
+
+/** The user message: the eight values with labels and units, the derived indices, and readable cm³ versions. */
+function userMessage(p: EdgePayload) {
+  const cm3 = (v: number | null) => (v == null ? null : Math.round(v / 100) / 10);
+  const readable = Object.fromEntries(
+    EDGE_FIELDS.filter((k) => k.endsWith('_mm3')).map((k) => [k.replace('_mm3', '_cm3'), cm3(p[k])]),
+  );
+  const lines = EDGE_FIELDS.map((k) => `- ${EDGE_FIELD_INFO[k].label}: ${p[k] ?? 'null'} ${EDGE_FIELD_INFO[k].unit}`);
+  return [
+    'Measurements (T12–L4 segment), as transmitted:',
+    ...lines,
+    '',
+    'Same values as JSON:',
+    JSON.stringify(p),
+    '',
+    'Volumes in cm³ (use these in the report):',
+    JSON.stringify(readable),
+    '',
+    'Derived indices:',
+    JSON.stringify(deriveIndices(p), null, 2),
+  ].join('\n');
+}
 
 const RETRY_NOTE = 'Your previous reply was not a valid JSON object. Reply again with only the JSON object described in the instructions: no markdown, no code fences, no other text.';
 
@@ -31,21 +71,29 @@ export async function POST(req: NextRequest) {
   const c = llmConfig();
   if (!c.url) return new Response('No language model configured. Set LLM_URL in .env.local.', { status: 501 });
 
-  let payload: AnalysisPayload;
+  let body: unknown;
   try {
-    payload = (await req.json()) as AnalysisPayload;
-    if (payload?.schema !== 'bodycomp.metrics/v1') throw new Error();
+    body = await req.json();
   } catch {
-    return new Response('Request body must be a bodycomp.metrics/v1 payload.', { status: 400 });
+    return new Response('Request body must be JSON.', { status: 400 });
   }
+  // Second whitelist check (the browser checks first). Anything but the eight numeric fields is refused here,
+  // before a single byte reaches the language model.
+  const check = validateEdgePayload(body);
+  if (!check.ok) {
+    audit('report.blocked', { user: proxyUser(req.headers), errors: check.errors });
+    return new Response(`Payload blocked by the whitelist check: ${check.errors.join('; ')}.`, { status: 422 });
+  }
+  const payload = body as EdgePayload;
+  const payloadSha256 = createHash('sha256').update(JSON.stringify(payload)).digest('hex');
 
   const messages: Msg[] = [
     { role: 'system', content: SYSTEM },
-    { role: 'user', content: `Body-composition measurements:\n${JSON.stringify(payload, null, 2)}` },
+    { role: 'user', content: userMessage(payload) },
   ];
   const promptSha256 = createHash('sha256').update(JSON.stringify(messages)).digest('hex');
   const started = Date.now();
-  audit('report.request', { user: proxyUser(req.headers), case_ref: payload.case_ref, model: c.model, prompt_sha256: promptSha256 });
+  audit('report.request', { user: proxyUser(req.headers), payload_sha256: payloadSha256, bytes: check.bytes, model: c.model, prompt_sha256: promptSha256 });
 
   // Ask for JSON mode first (vLLM, Ollama and others support it); drop it if this server rejects the option.
   let jsonMode = true;
@@ -77,11 +125,11 @@ export async function POST(req: NextRequest) {
       sentBody = out.body;
       narrative = parseNarrative(raw);
       if (narrative) break;
-      audit('report.unparsable', { case_ref: payload.case_ref, attempt: attempts, start: raw.slice(0, 120) });
+      audit('report.unparsable', { payload_sha256: payloadSha256, attempt: attempts, start: raw.slice(0, 120) });
     }
   } catch (e) {
     const err = e as Error;
-    audit('report.error', { case_ref: payload.case_ref, error: err.message });
+    audit('report.error', { payload_sha256: payloadSha256, error: err.message });
     if (err instanceof HttpError) return new Response(err.message, { status: 502 });
     return new Response(err.name === 'TimeoutError' ? 'The language model did not answer in time.' : `Cannot reach the language model (${err.message}).`, { status: 504 });
   }
@@ -95,16 +143,18 @@ export async function POST(req: NextRequest) {
     source: 'llm',
     generatedAt: new Date().toISOString(),
     narrative,
-    unverifiedNumbers: unverifiedNumbers(text, payload),
+    unverifiedNumbers: unverifiedNumbers(text, payload, deriveIndices(payload), [33, 41, 2013],
+      EDGE_FIELDS.map((k) => (payload[k] == null ? null : payload[k]! / 1000))),
     model: c.model,
     temperature: c.temperature,
     latencyMs: Date.now() - started,
     promptSha256,
     attempts,
     request: sentBody,
+    transmitted: payload,
     rawResponse: raw,
   };
-  audit('report.response', { case_ref: payload.case_ref, ms: result.latencyMs, attempts, json_mode: jsonMode, unverified: result.unverifiedNumbers.length });
+  audit('report.response', { payload_sha256: payloadSha256, ms: result.latencyMs, attempts, json_mode: jsonMode, unverified: result.unverifiedNumbers.length });
   return Response.json(result);
 }
 

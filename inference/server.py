@@ -15,13 +15,17 @@ MODEL (env var) picks the backend:
   totalseg  TotalSegmentator, task from TOTALSEG_TASK (default tissue_types: 1 SAT, 2 torso fat, 3 muscle).
             tissue_types needs a TotalSegmentator licence (free for non-commercial use):
               totalseg_set_license -l <your key>
-            AUTO_L3=1 (default) also runs the free "total" model on vertebrae_L3 and adds it as label 50,
-            so the viewer can set the L3 slice by itself. TOTALSEG_FAST=1 uses the faster 3 mm models.
+            AUTO_L3=1 (default) also runs the free "total" model on the vertebrae in VERTEBRAE (default "T12 L3 L4")
+            and adds them as labels 50 (L3), 51 (T12), 52 (L4), so the viewer sets the L3 slice and the T12–L4
+            range by itself. TOTALSEG_FAST=1 uses the faster 3 mm models.
             TOTALSEG_THREADS=1 lowers memory use (fewer worker processes).
   nnunet    nnU-Net v2. Either a model folder you downloaded (NNUNET_MODEL_FOLDER, NNUNET_FOLDS, NNUNET_CHECKPOINT)
             or a dataset in nnUNet_results (NNUNET_DATASET / NNUNET_CONFIG / NNUNET_FOLDS).
             Label names come from the model folder's dataset.json. AUTO_L3 also applies if TotalSegmentator is installed.
             NNUNET_THREADS=1 lowers memory use; NNUNET_DEVICE=cpu forces CPU.
+            DISABLE_TTA=1 (default) turns off mirroring test-time augmentation, the largest speed win.
+            A request can override it with the header X-TTA: on | off (used by benchmark.py).
+            nnU-Net already runs in mixed precision (FP16) on the GPU.
             (your own model; set LABEL_SCHEME=generic or totalseg to match its label numbers)
   demo      HU thresholds only (generic labels: 1 muscle-range, 3 fat-range). Pipeline test only.
 
@@ -58,6 +62,11 @@ TOTALSEG_FAST = os.environ.get("TOTALSEG_FAST", "0") == "1"
 # Worker processes for resampling/saving. Fewer = less memory (each worker can hold a copy of the volume).
 TOTALSEG_THREADS = os.environ.get("TOTALSEG_THREADS", "")
 L3_LABEL = 50
+# Vertebrae found by TotalSegmentator and merged into the mask. L3 sets the analysis slice; T12 and L4 bound the
+# T12–L4 range used for the volume metrics.
+VERTEBRAE = os.environ.get("VERTEBRAE", "T12 L3 L4").split()
+VERT_LABELS = {"L3": 50, "T12": 51, "L4": 52, "L1": 53, "L2": 54, "L5": 55, "T11": 56}
+DISABLE_TTA = os.environ.get("DISABLE_TTA", "1") == "1"
 API_KEY = os.environ.get("API_KEY", "")
 MAX_BYTES = 1024**3
 KEEP_RUNS = 50
@@ -148,6 +157,7 @@ class Run:
         self.started = time.time()
         self.finished: float | None = None
         self.status = "running"
+        self.tta: bool | None = None
         self.stages: dict[str, float] = {}
         self.logs: list[dict] = []
         self.samples: list[dict] = []
@@ -196,7 +206,7 @@ class Run:
                 "device": SAMPLER.device, "sampler": SAMPLER.kind,
                 "started": datetime.fromtimestamp(self.started).isoformat(timespec="seconds"),
                 "wall_s": round((self.finished or time.time()) - self.started, 2),
-                "status": self.status, "stages": self.stages, "logs": self.logs, "samples": self.samples}
+                "status": self.status, "tta": self.tta, "stages": self.stages, "logs": self.logs, "samples": self.samples}
 
 
 RUNS: "OrderedDict[str, Run]" = OrderedDict()
@@ -236,7 +246,7 @@ def get_run(run_id: str, x_api_key: str = Header("")):
 
 
 @app.post("/segment")
-async def segment(request: Request, x_filename: str = Header("ct.nii.gz"), x_api_key: str = Header("")):
+async def segment(request: Request, x_filename: str = Header("ct.nii.gz"), x_api_key: str = Header(""), x_tta: str = Header("")):
     check_key(x_api_key)
     name = Path(unquote(x_filename)).name
     suffix = ".nii.gz" if name.lower().endswith(".gz") else ".nii"
@@ -257,7 +267,8 @@ async def segment(request: Request, x_filename: str = Header("ct.nii.gz"), x_api
                     f.write(chunk)
             run.bytes = size
             run.log("DEBUG", "RECEIVE", f"{name}: {size / 1e6:.1f} MB written to scratch")
-        out, labels = run_model(run, ct, work)
+        tta = {"on": True, "off": False}.get(x_tta.strip().lower(), not DISABLE_TTA)
+        out, labels = run_model(run, ct, work, tta)
     except HTTPException:
         run.finish("failed")
         shutil.rmtree(work, ignore_errors=True)
@@ -272,6 +283,8 @@ async def segment(request: Request, x_filename: str = Header("ct.nii.gz"), x_api
     run.log("SUCCESS", "PIPELINE", f"completed in {run.to_dict()['wall_s']}s")
     scheme = {"totalseg": "totalseg", "demo": "generic"}.get(MODEL, os.environ.get("LABEL_SCHEME", "generic"))
     headers = {"X-Label-Scheme": scheme, "X-Run-Id": run.id}
+    if run.tta is not None:
+        headers["X-TTA"] = "on" if run.tta else "off"
     if labels:
         headers["X-Labels"] = quote(json.dumps({str(k): v for k, v in labels.items()}))
     return FileResponse(out, media_type="application/octet-stream",
@@ -393,28 +406,52 @@ def nnunet_labels(folder: str) -> dict[int, str] | None:
         return None
 
 
-def merge_l3(run: Run, tissue: Path, l3: Path) -> None:
-    """Write the L3 vertebra into the tissue mask as label 50 (bone does not overlap the soft-tissue labels)."""
+def detect_vertebrae(run: Run, ct: Path, tissue: Path, work: Path) -> dict[int, str]:
+    """Run TotalSegmentator's free "total" model on VERTEBRAE and write them into the tissue mask.
+
+    Each vertebra is saved as its own file (no --ml), so label numbering inside TotalSegmentator does not matter.
+    Bone does not overlap the soft-tissue labels. Returns the labels that were added."""
     import nibabel as nib
     import numpy as np
 
+    rois = [f"vertebrae_{v}" for v in VERTEBRAE if v in VERT_LABELS]
+    if not rois:
+        return {}
+    outdir = work / "vertebrae"
+    fast = ["--fast"] if TOTALSEG_FAST else []
+    if TOTALSEG_THREADS:
+        fast += ["-nr", TOTALSEG_THREADS, "-ns", TOTALSEG_THREADS]
+    with run.stage("vertebra_detection"):
+        stream_cmd(run, ["TotalSegmentator", "-i", str(ct), "-o", str(outdir), "--roi_subset", *rois, *fast], "TOTALSEG-VERT")
+
     t_img = nib.load(str(tissue))
     t = np.asanyarray(t_img.dataobj).astype(np.uint8)
-    v = np.asanyarray(nib.load(str(l3)).dataobj)
-    if v.shape != t.shape:
-        raise RuntimeError(f"L3 mask shape {v.shape} differs from tissue mask {t.shape}")
-    sel = v > 0
-    if not sel.any():
-        raise RuntimeError("L3 is not inside the scanned range")
-    t[sel] = L3_LABEL
-    out = nib.Nifti1Image(t, t_img.affine, t_img.header)
-    out.set_data_dtype(np.uint8)
-    out.header.set_slope_inter(1, 0)
-    nib.save(out, str(tissue))
-    run.log("INFO", "L3", f"L3 vertebra found: {int(sel.sum())} voxels")
+    added: dict[int, str] = {}
+    for roi in rois:
+        f = outdir / f"{roi}.nii.gz"
+        if not f.exists():
+            run.log("WARN", "VERTEBRAE", f"{roi}: no output file")
+            continue
+        v = np.asanyarray(nib.load(str(f)).dataobj)
+        if v.shape != t.shape:
+            raise RuntimeError(f"{roi} mask shape {v.shape} differs from tissue mask {t.shape}")
+        sel = v > 0
+        if not sel.any():
+            run.log("WARN", "VERTEBRAE", f"{roi} is not inside the scanned range")
+            continue
+        label = VERT_LABELS[roi.split("_", 1)[1]]
+        t[sel] = label
+        added[label] = roi
+        run.log("INFO", "VERTEBRAE", f"{roi} found: {int(sel.sum())} voxels → label {label}")
+    if added:
+        out = nib.Nifti1Image(t, t_img.affine, t_img.header)
+        out.set_data_dtype(np.uint8)
+        out.header.set_slope_inter(1, 0)
+        nib.save(out, str(tissue))
+    return added
 
 
-def run_model(run: Run, ct: Path, work: Path) -> tuple[Path, dict[int, str] | None]:
+def run_model(run: Run, ct: Path, work: Path, tta: bool = False) -> tuple[Path, dict[int, str] | None]:
     if MODEL == "totalseg":
         out = work / "tissue.nii.gz"
         fast = ["--fast"] if TOTALSEG_FAST else []
@@ -425,13 +462,9 @@ def run_model(run: Run, ct: Path, work: Path) -> tuple[Path, dict[int, str] | No
         labels = totalseg_labels(TOTALSEG_TASK)
         if AUTO_L3:
             try:
-                l3 = work / "l3.nii.gz"
-                with run.stage("l3_detection"):
-                    stream_cmd(run, ["TotalSegmentator", "-i", str(ct), "-o", str(l3), "--roi_subset", "vertebrae_L3", "--ml", *fast], "TOTALSEG-L3")
-                merge_l3(run, out, l3)
-                labels[L3_LABEL] = "vertebrae_L3"
-            except Exception as e:  # noqa: BLE001  L3 is a convenience; keep the tissue mask if it fails
-                run.log("WARN", "L3", f"automatic L3 detection failed, set it by hand: {str(e)[-200:]}")
+                labels.update(detect_vertebrae(run, ct, out, work))
+            except Exception as e:  # noqa: BLE001  landmarks are a convenience; keep the tissue mask if it fails
+                run.log("WARN", "VERTEBRAE", f"automatic vertebra detection failed, set L3 by hand: {str(e)[-200:]}")
         return out, labels
 
     if MODEL == "nnunet":
@@ -455,6 +488,10 @@ def run_model(run: Run, ct: Path, work: Path) -> tuple[Path, dict[int, str] | No
             cmd += ["-device", os.environ["NNUNET_DEVICE"]]
         if os.environ.get("NNUNET_THREADS"):  # fewer worker processes = less memory
             cmd += ["-npp", os.environ["NNUNET_THREADS"], "-nps", os.environ["NNUNET_THREADS"]]
+        if not tta:
+            cmd += ["--disable_tta"]
+        run.tta = tta
+        run.log("INFO", "NNUNET", f"test-time augmentation (mirroring) {'ON' if tta else 'OFF'}")
         with run.stage("inference"):
             stream_cmd(run, cmd, "NNUNET")
         found = sorted(outdir.glob("case.nii*"))
@@ -464,17 +501,9 @@ def run_model(run: Run, ct: Path, work: Path) -> tuple[Path, dict[int, str] | No
         labels = nnunet_labels(folder) if folder else None
         if AUTO_L3 and shutil.which("TotalSegmentator"):
             try:
-                l3 = work / "l3.nii.gz"
-                fast = ["--fast"] if TOTALSEG_FAST else []
-                if TOTALSEG_THREADS:
-                    fast += ["-nr", TOTALSEG_THREADS, "-ns", TOTALSEG_THREADS]
-                with run.stage("l3_detection"):
-                    stream_cmd(run, ["TotalSegmentator", "-i", str(next(inp.iterdir())), "-o", str(l3),
-                                     "--roi_subset", "vertebrae_L3", "--ml", *fast], "TOTALSEG-L3")
-                merge_l3(run, out, l3)
-                labels = {**(labels or {}), L3_LABEL: "vertebrae_L3"}
+                labels = {**(labels or {}), **detect_vertebrae(run, next(inp.iterdir()), out, work)}
             except Exception as e:  # noqa: BLE001
-                run.log("WARN", "L3", f"automatic L3 detection failed, set it by hand: {str(e)[-200:]}")
+                run.log("WARN", "VERTEBRAE", f"automatic vertebra detection failed, set L3 by hand: {str(e)[-200:]}")
         return out, labels
 
     if MODEL == "demo":

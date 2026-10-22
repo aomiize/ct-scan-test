@@ -1,3 +1,5 @@
+import type { EdgeCheck, EdgePayload } from './edge';
+import type { EdgeRange } from './edge-build';
 import type { AnalysisPayload, GeneratedReport, SignatureResult } from './report-types';
 import type { Cursor, LabelMap, MaskState, Patient, Volume, WindowLevel } from './types';
 import type { VolumeStats } from './volumetrics';
@@ -21,6 +23,7 @@ export interface RunRecord {
   started: string;
   wall_s: number;
   status: string;
+  tta?: boolean | null;
   stages: Record<string, number>;
   logs: { t: string; level: string; tag: string; msg: string }[];
   samples: RunSample[];
@@ -44,6 +47,10 @@ export interface Analysis {
   lut: Uint8Array;
   payload: AnalysisPayload | null;
   payloadKey: string;
+  /** The eight de-identified numbers that are the only data sent off the device, and their whitelist check. */
+  edge: EdgePayload | null;
+  edgeRange: EdgeRange | null;
+  edgeCheck: EdgeCheck | null;
   report: DraftReport | null;
   signature: SignatureResult | null;
   run: RunRecord | null;

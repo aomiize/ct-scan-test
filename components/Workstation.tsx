@@ -24,6 +24,8 @@ import type {
 } from '@/lib/types';
 import { buildLut, stepCursor } from '@/lib/views';
 import { volumeStats } from '@/lib/volumetrics';
+import { validateEdgePayload } from '@/lib/edge';
+import { buildEdgePayload, edgeRange } from '@/lib/edge-build';
 
 const VIEWS: ViewName[] = ['axial', 'coronal', 'sagittal'];
 const TABS = [
@@ -94,6 +96,14 @@ export default function Workstation() {
     [ref, vol, mask, labels, scheme, stats, patient, l3, sample],
   );
   const payloadKey = useMemo(() => (payload ? JSON.stringify(payload) : ''), [payload]);
+  // The eight numbers that leave the device (T12–L4 if the vertebrae were found), checked against the whitelist.
+  // Keyed on label names and roles only, so toggling a label's visibility does not recompute the body volume.
+  const labelKey = JSON.stringify(Object.entries(labels).map(([L, d]) => [L, d.name, d.role]));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const range = useMemo(() => (stats ? edgeRange(labels, stats) : null), [labelKey, stats]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const edge = useMemo(() => (vol && mask && range ? buildEdgePayload(vol, mask.data, labels, range) : null), [vol, mask, labelKey, range]);
+  const edgeCheck = useMemo(() => (edge ? validateEdgePayload(edge) : null), [edge]);
 
   // ---- theme ----
   useEffect(() => {
@@ -395,10 +405,21 @@ export default function Workstation() {
         source: 'rules', generatedAt: new Date().toISOString(), narrative: ruleNarrative(payload), unverifiedNumbers: [], fallbackReason,
       });
       let g: GeneratedReport;
-      if (llm?.configured) {
-        log('INFO', 'REPORT', `sending ${new Blob([key]).size} bytes of de-identified metrics to ${llm.model}`);
+      if (llm?.configured && !edge) {
+        g = rules('no segmentation: the eight-field payload needs a tissue mask');
+        log('WARN', 'REPORT', 'no segmentation loaded; nothing sent to the language model, rule-based draft written');
+      } else if (llm?.configured && edge) {
+        const check = validateEdgePayload(edge);
+        if (!check.ok) {
+          // Never send a payload that fails the whitelist, even if the server would also refuse it.
+          log('ERROR', 'PRIVACY', `payload blocked before transmission: ${check.errors.join('; ')}`);
+          throw new Error(`Payload blocked by the whitelist check: ${check.errors.join('; ')}`);
+        }
+        const body = JSON.stringify(edge);
+        log('INFO', 'PRIVACY', `whitelist check passed: 8 numeric fields, ${check.bytes} bytes, no identifiers`);
+        log('INFO', 'REPORT', `sending ${check.bytes} bytes to ${llm.model}`);
         try {
-          const r = await fetch('/api/report', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: key });
+          const r = await fetch('/api/report', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
           if (!r.ok) throw new Error(await errorText(r));
           g = (await r.json()) as GeneratedReport;
           log('SUCCESS', 'REPORT', `draft received in ${g.latencyMs} ms${(g.attempts ?? 1) > 1 ? ' after a retry' : ''}${g.unverifiedNumbers.length ? `; ${g.unverifiedNumbers.length} unverified numbers` : ''}`);
@@ -420,7 +441,7 @@ export default function Workstation() {
     } finally {
       setReportBusy(false);
     }
-  }, [payload, payloadKey, llm]);
+  }, [payload, payloadKey, llm, edge]);
 
   const editNarrative = (n: Narrative) => setReport((r) => (r ? { ...r, narrative: n, edited: true } : r));
 
@@ -513,7 +534,7 @@ export default function Workstation() {
     };
   }, [loadCT]);
 
-  const a: Analysis = { vol, ctName, sample, mask, labels, scheme, stats, patient, l3, cur, wl, lut, payload, payloadKey, report, signature, run, llm };
+  const a: Analysis = { vol, ctName, sample, mask, labels, scheme, stats, patient, l3, cur, wl, lut, payload, payloadKey, edge, edgeRange: range, edgeCheck, report, signature, run, llm };
 
   const viewport = (name: ViewName, title?: string) => (
     <Viewport

@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type { LabelMap, Role, Volume } from '@/lib/types';
+import { isLandmark } from '@/lib/labels';
 
 type Group = 'muscle' | 'fat' | 'bone' | 'other';
 const GROUP_OF: Record<Role, Group> = { muscle: 'muscle', sat: 'fat', vat: 'fat', imat: 'fat', bone: 'bone', other: 'other' };
@@ -43,8 +44,8 @@ function buildMeshes(vol: Volume, mask: Uint8Array, labels: LabelMap) {
   // Most body-composition masks have no bone label. Then take bone from the CT itself:
   // the highest HU in each block ≥ BONE_HU, kept only inside the body outline and in connected pieces big enough
   // to be skeleton (drops contrast specks and calcifications). The table sits outside the outline.
-  // A lone L3-vertebra landmark is not a skeleton, so it does not stop the CT-based bone.
-  const hasBone = Object.values(labels).some((d) => d.role === 'bone' && d.name !== 'L3 vertebra');
+  // Vertebra landmarks (L3, T12, L4) are not a skeleton, so they do not stop the CT-based bone.
+  const hasBone = Object.values(labels).some((d) => d.role === 'bone' && !isLandmark(d.name));
   let boneDs: Uint8Array | null = null;
   if (!hasBone) {
     boneDs = new Uint8Array(dx * dy * dz);

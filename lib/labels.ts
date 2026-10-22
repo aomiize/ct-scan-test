@@ -98,13 +98,18 @@ const NAME_ROLES: [RegExp, string, Role][] = [
   [/^torso_fat$/, 'Torso fat (VAT proxy)', 'vat'],
   [/^(sat|s_?fat|subcutaneous(_adipose)?(_fat|_tissue)?)$/, 'Subcutaneous fat', 'sat'],
   [/^(vat|v_?fat|visceral(_adipose)?(_fat|_tissue)?)$/, 'Visceral fat', 'vat'],
-  [/^(imat|m_?fat|muscular_fat|intra_?muscular(_adipose)?(_fat|_tissue)?|inter_?muscular(_adipose)?(_fat|_tissue)?)$/, 'Intermuscular fat', 'imat'],
+  [/^(imat|m_?fat|muscle_?fat|muscular_fat|intra_?muscular(_adipose)?(_fat|_tissue)?|inter_?muscular(_adipose)?(_fat|_tissue)?)$/, 'Intermuscular fat', 'imat'],
   [/^(skeletal_)?muscles?$/, 'Skeletal muscle', 'muscle'],
   [/^vertebrae_l3$/, 'L3 vertebra', 'bone'],
+  [/^vertebrae_t12$/, 'T12 vertebra', 'bone'],
+  [/^vertebrae_l4$/, 'L4 vertebra', 'bone'],
   [/^vertebrae_/, '', 'bone'],
   [/^muscle_hu_range$/, 'Muscle-range HU (demo)', 'muscle'],
   [/^fat_hu_range$/, 'Fat-range HU (demo)', 'vat'],
 ];
+
+/** Vertebrae added by the segmentation server as landmarks (L3 slice, T12–L4 range), not a bone segmentation. */
+export const isLandmark = (name: string) => /^(T11|T12|L[1-5]) vertebra$/.test(name);
 
 /** Labels from names sent by the segmentation server, so numbering never has to be guessed. */
 export function labelsFromNames(counts: Float64Array, names: Record<string, string>): LabelMap {
@@ -121,8 +126,8 @@ export function labelsFromNames(counts: Float64Array, names: Record<string, stri
       name,
       role,
       color: hit ? ROLE_COLOR[role] : EXTRA[e++ % EXTRA.length],
-      // the L3 vertebra is a landmark: keep it visible so the level can be checked
-      visible: role !== 'bone' || /L3/i.test(name),
+      // vertebra landmarks stay visible so the level and the T12–L4 range can be checked
+      visible: role !== 'bone' || isLandmark(name),
     };
   }
   return out;

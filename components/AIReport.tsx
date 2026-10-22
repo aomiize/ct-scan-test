@@ -86,7 +86,7 @@ export default function AIReport({ a, busy, onGenerate, onPrint, onEdit, onSign 
             <div className="panel empty-block">
               <p className="empty">
                 {a.llm?.configured
-                  ? `Generate a draft with ${a.llm.model}. Only the de-identified numbers shown on the Transmitted JSON tab are sent.`
+                  ? `Generate a draft with ${a.llm.model}. Only the eight de-identified numbers shown on the Transmitted JSON tab are sent (T12–L4 volumes and muscle density); the L3 indices above stay on this device.`
                   : 'No language model is configured (LLM_URL). A rule-based draft can be written from the measured values instead.'}
               </p>
             </div>
