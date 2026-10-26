@@ -1,5 +1,6 @@
 import 'server-only';
 import path from 'node:path';
+import { authEnabled, userFromHeaders } from '@/lib/auth';
 
 /** Base URL of the inference server, derived from INFERENCE_URL (…/segment). */
 export function inferenceBase(): string | null {
@@ -23,8 +24,9 @@ export const llmConfig = () => ({
 export const dataDir = () => path.resolve(process.env.DATA_DIR || './data');
 export const casesDir = () => (process.env.CASES_DIR ? path.resolve(process.env.CASES_DIR) : null);
 
-/** User identity set by the hospital reverse proxy (SSO), if any. */
+/** Signed-in user (password login), or the identity set by a hospital reverse proxy (SSO) when login is off. */
 export function proxyUser(h: Headers): string | null {
+  if (authEnabled()) return userFromHeaders(h);
   return h.get('x-forwarded-user') || h.get('remote-user') || h.get('x-remote-user') || null;
 }
 

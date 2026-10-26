@@ -1,5 +1,7 @@
+import { protect } from '@/lib/auth';
 import { createHash } from 'node:crypto';
 import { NextRequest } from 'next/server';
+import { asyncable } from '@/lib/server/jobs';
 import { deriveIndices, EDGE_FIELD_INFO, EDGE_FIELDS, type EdgePayload, validateEdgePayload } from '@/lib/edge';
 import { unverifiedNumbers } from '@/lib/payload';
 import type { GeneratedReport, Narrative } from '@/lib/report-types';
@@ -62,12 +64,12 @@ const RETRY_NOTE = 'Your previous reply was not a valid JSON object. Reply again
 
 type Msg = { role: 'system' | 'user' | 'assistant'; content: string };
 
-export async function GET() {
+async function getHandler() {
   const c = llmConfig();
   return Response.json({ configured: !!c.url, model: c.url ? c.model : null });
 }
 
-export async function POST(req: NextRequest) {
+async function handle(req: NextRequest): Promise<Response> {
   const c = llmConfig();
   if (!c.url) return new Response('No language model configured. Set LLM_URL in .env.local.', { status: 501 });
 
@@ -213,3 +215,8 @@ function parseNarrative(reply: string): Narrative | null {
   // Reject replies that parsed but carry no report text.
   return n.summary || n.muscle || n.adipose ? n : null;
 }
+
+/** Runs in the background when the browser sends X-Async: 1 (see lib/server/jobs.ts). */
+export const POST = protect(asyncable(handle));
+
+export const GET = protect(getHandler);

@@ -1,8 +1,9 @@
+import { protect } from '@/lib/auth';
 import { inferenceBase, inferenceHeaders } from '@/lib/server/config';
 
 export const dynamic = 'force-dynamic';
 
-export async function GET() {
+async function getHandler() {
   const base = inferenceBase();
   if (!base) return Response.json({ configured: false });
   try {
@@ -13,3 +14,5 @@ export async function GET() {
     return Response.json({ configured: true, online: false, error: (e as Error).message });
   }
 }
+
+export const GET = protect(getHandler);

@@ -82,6 +82,17 @@ The typed reader name is not authentication. Put the app behind your SSO reverse
 
 `lib/reference.ts` holds every threshold with its citation: SMI and muscle attenuation (Martin 2013), visceral fat area (Doyle 2013, measured at L3–L4). The VAT/SAT ratio and volumetric values have no reference set. Replace these with values validated for your population.
 
+## DICOM
+
+DICOM folders and .zip files are converted to NIfTI in the browser (`lib/dicom.ts`, result identical to SimpleITK on
+the test study), so the DICOM headers with patient details never leave the user's computer and no server is needed.
+The largest CT series is used; scouts/localizers are skipped. Compressed studies (JPEG, JPEG 2000, RLE) are sent to
+the inference server's `/convert` instead, if `INFERENCE_URL` is set.
+
+## Sign-in
+
+Set `APP_PASSWORD` (one shared password) or `APP_USERS=mon:pass1,prof:pass2` (named accounts) in `.env.local` and restart. Every page and API then requires signing in; the session is a signed, HTTP-only cookie (12 h by default, `SESSION_HOURS`). Five wrong passwords from one address lock it out for 15 minutes. The signed-in name is written to the audit log and into signed reports. With neither variable set there is no login.
+
 ## Production
 
 ```bash

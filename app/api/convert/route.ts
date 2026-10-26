@@ -1,4 +1,6 @@
+import { protect } from '@/lib/auth';
 import { NextRequest } from 'next/server';
+import { asyncable } from '@/lib/server/jobs';
 import { hdr, longPost } from '@/lib/server/long-post';
 import { audit, inferenceBase, inferenceHeaders, proxyUser } from '@/lib/server/config';
 
@@ -7,7 +9,7 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 export const maxDuration = 1800;
 
-export async function POST(req: NextRequest) {
+async function handle(req: NextRequest): Promise<Response> {
   const base = inferenceBase();
   if (!base) return new Response('DICOM conversion runs on the inference server. Set INFERENCE_URL in .env.local.', { status: 501 });
   if (!req.body) return new Response('No DICOM upload in the request.', { status: 400 });
@@ -44,3 +46,6 @@ export async function POST(req: NextRequest) {
     return new Response(err.name === 'TimeoutError' ? 'The inference server did not finish converting in time.' : `Cannot reach the inference server (${err.message}).`, { status: 504 });
   }
 }
+
+/** Runs in the background when the browser sends X-Async: 1 (see lib/server/jobs.ts). */
+export const POST = protect(asyncable(handle));

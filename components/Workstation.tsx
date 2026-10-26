@@ -13,7 +13,8 @@ import type { Analysis, DraftReport, RunRecord } from '@/lib/analysis';
 import { metricsCsv } from '@/lib/csv';
 import { downloadText } from '@/lib/download';
 import { labelsFor, labelsFromNames, middleSlice, ROLE_COLOR, thresholdMask } from '@/lib/labels';
-import { zip as zipFiles } from 'fflate';
+import { unzipSync, zip as zipFiles } from 'fflate';
+import { CompressedDicomError, dicomToNifti, type DicomFile } from '@/lib/dicom';
 import { countLabels, readNifti, toMask, toVolume } from '@/lib/nifti';
 import { buildPayload, caseRef, ruleNarrative } from '@/lib/payload';
 import { makePhantom } from '@/lib/phantom';
@@ -26,6 +27,7 @@ import { buildLut, stepCursor } from '@/lib/views';
 import { volumeStats } from '@/lib/volumetrics';
 import { validateEdgePayload } from '@/lib/edge';
 import { buildEdgePayload, edgeRange } from '@/lib/edge-build';
+import { postJob } from '@/lib/job-client';
 
 const VIEWS: ViewName[] = ['axial', 'coronal', 'sagittal'];
 const TABS = [
@@ -72,6 +74,7 @@ export default function Workstation() {
   const [dragging, setDragging] = useState(false);
   const [inferenceReady, setInferenceReady] = useState<boolean | null>(null);
   const [llm, setLlm] = useState<{ configured: boolean; model: string | null } | null>(null);
+  const [me, setMe] = useState<{ auth: boolean; user: string | null } | null>(null);
   const [cases, setCases] = useState<{ configured: boolean; cases: CaseEntry[]; error?: string } | null>(null);
   const [pendingMask, setPendingMask] = useState<File | null>(null);
   const [ref, setRef] = useState('');
@@ -176,6 +179,7 @@ export default function Workstation() {
     const j = (u: string) => fetch(u, { cache: 'no-store' }).then((r) => r.json());
     j('/api/segment').then((r: { configured: boolean }) => setInferenceReady(r.configured)).catch(() => setInferenceReady(false));
     j('/api/report').then(setLlm).catch(() => setLlm({ configured: false, model: null }));
+    j('/api/me').then(setMe).catch(() => {});
     j('/api/cases').then(setCases).catch(() => setCases({ configured: false, cases: [] }));
   }, [loadSample]);
 
@@ -274,49 +278,77 @@ export default function Workstation() {
     [loadCT],
   );
 
-  /** DICOM folder or .zip → the inference server converts one series to NIfTI → opened like any CT. */
+  /** DICOM on the inference server: used only for compressed studies the browser cannot decode. */
+  const convertOnServer = useCallback(async (files: DicomFile[], label: string, t0: number) => {
+    const entries: Record<string, Uint8Array> = {};
+    for (const f of files) {
+      let path = f.name.replace(/[^\w.\-/]/g, '_');
+      for (let n = 1; path in entries; n++) path = `${path}_${n}`;
+      entries[path] = f.bytes;
+    }
+    // store without compression: DICOM pixel data barely compresses and this keeps it fast
+    const body = new Blob([await new Promise<Uint8Array>((res, rej) => zipFiles(entries, { level: 0 }, (e, d) => (e ? rej(e) : res(d))))], { type: 'application/zip' });
+    setStatus({ text: 'Converting DICOM on the inference server…' });
+    const r = await postJob('/api/convert', { headers: { 'Content-Type': 'application/zip' }, body }, (sec) => setStatus({ text: `Converting DICOM on the inference server… ${sec} s` }));
+    if (!r.ok) throw new Error(await errorText(r));
+    let info = '';
+    try {
+      const list = JSON.parse(decodeURIComponent(r.headers.get('x-series') || '[]')) as { id: string; slices: number; description: string; modality: string }[];
+      const chosen = list.find((x) => x.id === r.headers.get('x-series-chosen'));
+      info = chosen ? `${chosen.modality || 'series'} "${chosen.description || 'no description'}", ${chosen.slices} slices` : '';
+    } catch {}
+    log('SUCCESS', 'DICOM', `converted on the server ${info} in ${((performance.now() - t0) / 1000).toFixed(1)} s; patient metadata not carried over`);
+    return new File([await r.blob()], `${label}.nii.gz`);
+  }, []);
+
+  /**
+   * DICOM folder or .zip → NIfTI, converted in this browser (headers with patient details never leave the computer).
+   * Compressed studies fall back to the inference server if one is configured.
+   */
   const openDicom = useCallback(
-    async (files: File[]) => {
-      if (!files.length) return;
+    async (input: File[]) => {
+      if (!input.length) return;
       const t0 = performance.now();
       try {
         setBusy(true);
-        let body: Blob;
+        let files: DicomFile[] = [];
         let label: string;
-        if (files.length === 1 && /\.zip$/i.test(files[0].name)) {
-          body = files[0];
-          label = files[0].name.replace(/\.zip$/i, '');
+        const skip = (n: string) => /(^|\/)(\.|__MACOSX)|DICOMDIR$|\.(txt|xml|json|jpe?g|png|pdf|exe|inf|ini|html?|zip)$/i.test(n);
+        if (input.length === 1 && /\.zip$/i.test(input[0].name)) {
+          setStatus({ text: `Unpacking ${input[0].name}…` });
+          label = input[0].name.replace(/\.zip$/i, '');
+          const zipped = new Uint8Array(await input[0].arrayBuffer());
+          await tick();
+          // Synchronous on purpose: fflate's async unzip starts one worker per entry, which can crash the tab
+          // for a study with hundreds of files. DICOM zips are usually stored, so this takes about a second.
+          const out = unzipSync(zipped, { filter: (f) => f.originalSize > 132 && !f.name.endsWith('/') && !skip(f.name) });
+          files = Object.entries(out).map(([name, bytes]) => ({ name, bytes }));
         } else {
-          setStatus({ text: `Packing ${files.length} DICOM files…` });
-          const entries: Record<string, Uint8Array> = {};
-          let total = 0;
-          for (const f of files) {
-            if (/^\.|DICOMDIR$|\.(txt|xml|json|jpg|png|pdf|exe|inf|ini|html?)$/i.test(f.name)) continue;
-            // keep the folder layout; only make names unique
-            let path = ((f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name).replace(/[^\w.\-/]/g, '_');
-            for (let n = 1; path in entries; n++) path = `${path}_${n}`;
-            entries[path] = new Uint8Array(await f.arrayBuffer());
-            total += f.size;
+          setStatus({ text: `Reading ${input.length} files…` });
+          label = ((input[0] as File & { webkitRelativePath?: string }).webkitRelativePath || '').split('/')[0] || 'dicom_series';
+          for (const f of input) {
+            const name = (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name;
+            if (!skip(name) && f.size > 132) files.push({ name, bytes: new Uint8Array(await f.arrayBuffer()) });
           }
-          if (!Object.keys(entries).length) throw new Error('No DICOM files in that folder.');
-          // store without compression: DICOM pixel data barely compresses and this keeps it fast
-          body = new Blob([await new Promise<Uint8Array>((res, rej) => zipFiles(entries, { level: 0 }, (e, d) => (e ? rej(e) : res(d))))], { type: 'application/zip' });
-          const first = (files[0] as File & { webkitRelativePath?: string }).webkitRelativePath || '';
-          label = first.split('/')[0] || 'dicom_series';
-          log('INFO', 'DICOM', `${Object.keys(entries).length} files (${(total / 1e6).toFixed(1)} MB) packed in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
         }
-        setStatus({ text: 'Converting DICOM on the inference server…' });
-        const r = await fetch('/api/convert', { method: 'POST', headers: { 'Content-Type': 'application/zip' }, body });
-        if (!r.ok) throw new Error(await errorText(r));
-        let info = '';
+        if (!files.length) throw new Error('No DICOM files found.');
+        label = label.replace(/[^\w.\-]/g, '_');
+        log('INFO', 'DICOM', `${files.length} files (${(files.reduce((a, f) => a + f.bytes.length, 0) / 1e6).toFixed(1)} MB) read in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+
+        let nii: File;
         try {
-          const list = JSON.parse(decodeURIComponent(r.headers.get('x-series') || '[]')) as { id: string; slices: number; description: string; modality: string }[];
-          const chosen = list.find((x) => x.id === r.headers.get('x-series-chosen'));
-          info = chosen ? `${chosen.modality || 'series'} "${chosen.description || 'no description'}", ${chosen.slices} slices` : '';
-          if (list.length > 1) log('INFO', 'DICOM', `${list.length} series found; opened the largest CT series. Others: ${list.filter((x) => x !== chosen).map((x) => `${x.description || x.id} (${x.slices})`).join('; ')}`);
-        } catch {}
-        const nii = new File([await r.blob()], `${label.replace(/[^\w.\-]/g, '_')}.nii.gz`);
-        log('SUCCESS', 'DICOM', `converted ${info} in ${((performance.now() - t0) / 1000).toFixed(1)} s; patient metadata not carried over`);
+          await tick();
+          const r = await dicomToNifti(files, (msg) => setStatus({ text: msg }));
+          if (r.series.length > 1) log('INFO', 'DICOM', `${r.series.length} series found; opened the largest CT series. Others: ${r.series.filter((x) => x !== r.chosen).map((x) => `${x.description || x.uid.slice(-8)} (${x.slices})`).join('; ')}`);
+          r.warnings.forEach((w) => log('WARN', 'DICOM', w));
+          log('SUCCESS', 'DICOM', `converted in this browser: ${r.chosen.modality || 'series'} "${r.chosen.description || 'no description'}", ${r.chosen.slices} slices in ${((performance.now() - t0) / 1000).toFixed(1)} s; DICOM headers stay on this computer`);
+          nii = new File([r.nifti as BlobPart], `${label}.nii.gz`);
+        } catch (err) {
+          if (!(err instanceof CompressedDicomError)) throw err;
+          if (!inferenceReady) throw new Error(`${err.message} Configure INFERENCE_URL to convert it on the inference server, or export the study uncompressed.`);
+          log('WARN', 'DICOM', `${err.message} Converting on the inference server instead.`);
+          nii = await convertOnServer(files, label, t0);
+        }
         setBusy(false);
         await loadCT(nii);
       } catch (err) {
@@ -325,7 +357,7 @@ export default function Workstation() {
         setBusy(false);
       }
     },
-    [loadCT],
+    [loadCT, inferenceReady, convertOnServer],
   );
 
   const fetchRun = useCallback(async (id: string) => {
@@ -348,11 +380,10 @@ export default function Workstation() {
       setBusy(true);
       setStatus({ text: `Sending ${ctFile.name} to the segmentation server…` });
       log('INFO', 'INFERENCE', `uploading ${ctFile.name} (${(ctFile.size / 1e6).toFixed(1)} MB)`);
-      const res = await fetch('/api/segment', {
-        method: 'POST',
+      const res = await postJob('/api/segment', {
         headers: { 'Content-Type': 'application/octet-stream', 'X-Filename': encodeURIComponent(ctFile.name) },
         body: ctFile,
-      });
+      }, (sec) => setStatus({ text: `Segmenting on the edge device… ${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}` }));
       const runId = res.headers.get('x-run-id');
       if (!res.ok) {
         if (runId) void fetchRun(runId);
@@ -419,7 +450,7 @@ export default function Workstation() {
         log('INFO', 'PRIVACY', `whitelist check passed: 8 numeric fields, ${check.bytes} bytes, no identifiers`);
         log('INFO', 'REPORT', `sending ${check.bytes} bytes to ${llm.model}`);
         try {
-          const r = await fetch('/api/report', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+          const r = await postJob('/api/report', { headers: { 'Content-Type': 'application/json' }, body }, (sec) => setStatus({ text: `Waiting for ${llm.model}… ${sec} s` }));
           if (!r.ok) throw new Error(await errorText(r));
           g = (await r.json()) as GeneratedReport;
           log('SUCCESS', 'REPORT', `draft received in ${g.latencyMs} ms${(g.attempts ?? 1) > 1 ? ' after a retry' : ''}${g.unverifiedNumbers.length ? `; ${g.unverifiedNumbers.length} unverified numbers` : ''}`);
@@ -584,6 +615,11 @@ export default function Workstation() {
           <span className={`chip-s ${mask ? 'on' : ''}`}><em>Segmentation</em>{segState}</span>
           <span className={`chip-s ${signature ? 'on' : report ? 'mid' : ''}`}><em>Report</em>{repState}</span>
           <button type="button" className="btn small" onClick={toggleTheme} aria-label="Switch light or dark theme">Theme</button>
+          {me?.auth && (
+            <a className="btn small" href="/api/logout" title={`Signed in as ${me.user ?? ''}`}>
+              {me.user} · Sign out
+            </a>
+          )}
         </div>
       </header>
 

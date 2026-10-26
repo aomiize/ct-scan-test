@@ -4,11 +4,14 @@ import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type { LabelMap, Role, Volume } from '@/lib/types';
-import { isLandmark } from '@/lib/labels';
+import { isLandmark, ROLE_COLOR } from '@/lib/labels';
 
-type Group = 'muscle' | 'fat' | 'bone' | 'other';
-const GROUP_OF: Record<Role, Group> = { muscle: 'muscle', sat: 'fat', vat: 'fat', imat: 'fat', bone: 'bone', other: 'other' };
+// Each fat compartment is its own group so subcutaneous and visceral fat can be shown separately.
+type Group = Role;
+const GROUP_OF: Record<Role, Group> = { muscle: 'muscle', sat: 'sat', vat: 'vat', imat: 'imat', bone: 'bone', other: 'other' };
+const ALL_ON: Record<Group, boolean> = { muscle: true, sat: true, vat: true, imat: true, bone: true, other: false };
 const OPACITY: Record<Role, number> = { muscle: 0.55, sat: 0.16, vat: 0.4, imat: 0.6, bone: 1, other: 0.5 };
+const FAT_LAYERS: [Role, string][] = [['sat', 'Subcutaneous fat'], ['vat', 'Visceral fat'], ['imat', 'Intermuscular fat']];
 const MAX_DIM = 112;
 const BONE_HU = 250;
 const MIN_BONE_PIECE = 40;
@@ -166,7 +169,7 @@ export default function Mesh3D({ vol, mask, labels, sliceK, l3 }: Props) {
     renderer: THREE.WebGLRenderer; scene: THREE.Scene; camera: THREE.PerspectiveCamera; controls: OrbitControls;
     root: THREE.Group; plane: THREE.Mesh; l3Plane: THREE.LineSegments; render: () => void; radius: number; zOf: (k: number) => number;
   } | null>(null);
-  const [show, setShow] = useState<Record<Group, boolean>>({ muscle: true, fat: true, bone: true, other: false });
+  const [show, setShow] = useState<Record<Group, boolean>>(ALL_ON);
   const [info, setInfo] = useState('');
   const [boneFromCt, setBoneFromCt] = useState(false);
   // Muscle is see-through so the skeleton shows; solid when isolated.
@@ -346,6 +349,7 @@ export default function Mesh3D({ vol, mask, labels, sliceK, l3 }: Props) {
   }
 
   const toggle = (g: Group) => setShow((s) => ({ ...s, [g]: !s[g] }));
+  const present = new Set(Object.values(labels).map((d) => d.role));
 
   return (
     <div className="mesh3d">
@@ -360,13 +364,19 @@ export default function Mesh3D({ vol, mask, labels, sliceK, l3 }: Props) {
         <div className="mesh-hint">Drag to orbit · scroll to zoom · right-drag to pan</div>
       </div>
       <div className="row mesh-controls">
-        <button type="button" className="btn small" aria-pressed={show.muscle && !show.fat && !show.bone} onClick={() => { setShow({ muscle: true, fat: false, bone: false, other: false }); setMuscleSolid(true); }}>Isolate muscle</button>
+        <button type="button" className="btn small" aria-pressed={show.muscle && !show.sat && !show.vat && !show.imat && !show.bone} onClick={() => { setShow({ muscle: true, sat: false, vat: false, imat: false, bone: false, other: false }); setMuscleSolid(true); }}>Isolate muscle</button>
         <label className="check"><input type="checkbox" checked={show.muscle} onChange={() => toggle('muscle')} />Muscle</label>
         <label className="check"><input type="checkbox" checked={muscleSolid} onChange={(e) => setMuscleSolid(e.target.checked)} />Solid muscle</label>
-        <label className="check"><input type="checkbox" checked={show.fat} onChange={() => toggle('fat')} />Fat</label>
+        {FAT_LAYERS.filter(([r]) => present.has(r)).map(([r, name]) => (
+          <label key={r} className="check">
+            <input type="checkbox" checked={show[r]} onChange={() => toggle(r)} />
+            <span className="sw" style={{ background: `rgb(${ROLE_COLOR[r].join(',')})` }} />
+            {name}
+          </label>
+        ))}
         <label className="check" title={boneFromCt ? `The mask has no bone label, so bone is taken from CT voxels ≥ ${BONE_HU} HU` : undefined}><input type="checkbox" checked={show.bone} onChange={() => toggle('bone')} />{boneFromCt ? `Bone (CT ≥ ${BONE_HU} HU)` : 'Bone'}</label>
         <label className="check"><input type="checkbox" checked={show.other} onChange={() => toggle('other')} />Other</label>
-        <button type="button" className="btn small" onClick={() => { setShow({ muscle: true, fat: true, bone: true, other: false }); setMuscleSolid(false); preset('iso'); }}>Reset view</button>
+        <button type="button" className="btn small" onClick={() => { setShow(ALL_ON); setMuscleSolid(false); preset('iso'); }}>Reset view</button>
         <span className="note sp">{info}{info && ' · amber plane = current axial, outline = L3'}</span>
       </div>
     </div>

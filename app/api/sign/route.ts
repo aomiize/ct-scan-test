@@ -1,3 +1,4 @@
+import { protect } from '@/lib/auth';
 import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -10,7 +11,7 @@ import { signingKey, signText } from '@/lib/server/signing';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-export async function GET() {
+async function getHandler() {
   const k = signingKey();
   return Response.json({ algorithm: 'Ed25519', fingerprint: k.fingerprint, publicKeyPem: k.pubPem });
 }
@@ -23,7 +24,7 @@ interface SignRequest {
   decision: 'approved' | 'amended';
 }
 
-export async function POST(req: NextRequest) {
+async function postHandler(req: NextRequest) {
   let b: SignRequest;
   try {
     b = (await req.json()) as SignRequest;
@@ -68,3 +69,6 @@ export async function POST(req: NextRequest) {
   const res: SignatureResult = { sha256, signature, algorithm: 'Ed25519', keyFingerprint: fingerprint, signedAt, reader, authenticatedUser, file };
   return Response.json(res);
 }
+
+export const GET = protect(getHandler);
+export const POST = protect(postHandler);

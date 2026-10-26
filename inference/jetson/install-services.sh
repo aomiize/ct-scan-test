@@ -80,6 +80,8 @@ Wants=network-online.target
 [Service]
 User=$RUN_USER
 WorkingDirectory=$REPO
+# Read settings (passwords, LLM) at start, so editing .env.local only needs a restart, not a rebuild.
+EnvironmentFile=-$REPO/.env.local
 Environment=HOSTNAME=0.0.0.0
 Environment=PORT=$WEB_PORT
 Environment=NODE_ENV=production

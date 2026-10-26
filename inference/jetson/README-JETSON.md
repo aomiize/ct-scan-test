@@ -137,6 +137,28 @@ Then, with the server running, from the `inference` folder:
 It runs the same CT with TTA off and on (per-request `X-TTA` header, so no server restart), prints mean inference time,
 total time, peak memory and whether the 5-minute target is met, and saves a CSV for the report.
 
+## 6. Access from outside the network
+
+Set a password first (`APP_USERS` or `APP_PASSWORD` in `.env.local`, see the main README). Long steps
+(segmentation, DICOM conversion, the report) run as background jobs the browser polls, so tunnels with short
+request limits (Cloudflare: 100 s) do not cut them off. Uploads through Cloudflare's free plan are limited to 100 MB.
+
+**Public HTTPS link with a fixed address (Tailscale Funnel):**
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up                 # sign in once
+sudo tailscale funnel --bg 3000   # first time it prints a link to enable Funnel/HTTPS for your account
+tailscale funnel status           # shows https://<machine>.<tailnet>.ts.net
+```
+Stop with `sudo tailscale funnel --https=443 off`. Keeps working after reboots.
+
+**Quick temporary link (Cloudflare, no account; the address changes every time it starts):**
+```bash
+wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64.deb
+sudo dpkg -i cloudflared-linux-arm64.deb
+cloudflared tunnel --url http://localhost:3000
+```
+
 ## Troubleshooting
 
 - **Logs:** `docker logs -f bodycomp-seg` (the app's Run log tab shows the same lines per run).

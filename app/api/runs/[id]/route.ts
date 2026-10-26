@@ -1,8 +1,9 @@
+import { protect } from '@/lib/auth';
 import { inferenceBase, inferenceHeaders } from '@/lib/server/config';
 
 export const dynamic = 'force-dynamic';
 
-export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> }) {
+async function getHandler(_req: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
   const base = inferenceBase();
   if (!base) return new Response('No inference server configured.', { status: 501 });
@@ -14,3 +15,5 @@ export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> 
     return new Response(`Cannot reach the inference server (${(e as Error).message}).`, { status: 504 });
   }
 }
+
+export const GET = protect(getHandler);

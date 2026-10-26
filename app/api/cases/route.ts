@@ -1,3 +1,4 @@
+import { protect } from '@/lib/auth';
 import { readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { casesDir } from '@/lib/server/config';
@@ -9,7 +10,7 @@ const NII = /\.nii(\.gz)?$/i;
 const MASK = /(seg|mask|label|lbl)/i;
 
 /** Lists CT volumes in CASES_DIR and pairs each with a mask whose name starts with the same stem. */
-export async function GET() {
+async function getHandler() {
   const dir = casesDir();
   if (!dir) return Response.json({ configured: false, cases: [] });
   let names: string[];
@@ -30,3 +31,5 @@ export async function GET() {
     .sort((a, b) => b.modified.localeCompare(a.modified));
   return Response.json({ configured: true, cases });
 }
+
+export const GET = protect(getHandler);

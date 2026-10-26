@@ -1,4 +1,6 @@
+import { protect } from '@/lib/auth';
 import { NextRequest } from 'next/server';
+import { asyncable } from '@/lib/server/jobs';
 import { hdr, longPost } from '@/lib/server/long-post';
 
 // Proxies the CT to the segmentation server so the browser never needs direct access to the GPU host.
@@ -10,11 +12,11 @@ const TIMEOUT_MS = Number(process.env.SEGMENT_TIMEOUT_S || 3600) * 1000;
 
 const MAX_BYTES = 1024 * 1024 * 1024; // 1 GB
 
-export async function GET() {
+async function getHandler() {
   return Response.json({ configured: !!process.env.INFERENCE_URL });
 }
 
-export async function POST(req: NextRequest) {
+async function handle(req: NextRequest): Promise<Response> {
   const target = process.env.INFERENCE_URL;
   if (!target) {
     return new Response('No inference server configured. Set INFERENCE_URL in .env.local and restart.', { status: 501 });
@@ -72,3 +74,8 @@ export async function POST(req: NextRequest) {
     return new Response(msg, { status: 504 });
   }
 }
+
+/** Runs in the background when the browser sends X-Async: 1 (see lib/server/jobs.ts). */
+export const POST = protect(asyncable(handle));
+
+export const GET = protect(getHandler);
