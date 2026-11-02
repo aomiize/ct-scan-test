@@ -11,6 +11,9 @@ export const config = {
 const PUBLIC = new Set(['/login']);
 
 export function middleware(req: NextRequest) {
+  // This app has no Server Actions. Internet scanners probe public Next.js sites with fake "Next-Action" headers;
+  // refuse those here so they never reach Next.js (and stop filling the log with "Server Reference ID" errors).
+  if (req.headers.has('next-action')) return new NextResponse(null, { status: 404 });
   if (!authEnabled()) return NextResponse.next();
   const { pathname, search } = req.nextUrl;
   if (PUBLIC.has(pathname)) return NextResponse.next();

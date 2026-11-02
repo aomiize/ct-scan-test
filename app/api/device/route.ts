@@ -11,7 +11,9 @@ async function getHandler() {
     if (!r.ok) return Response.json({ configured: true, online: false, error: `HTTP ${r.status}` });
     return Response.json({ configured: true, online: true, ...(await r.json()) });
   } catch (e) {
-    return Response.json({ configured: true, online: false, error: (e as Error).message });
+    const err = e as Error & { cause?: { code?: string } };
+    const code = err.name === 'TimeoutError' ? 'no answer within 5 s' : err.cause?.code === 'ECONNREFUSED' ? 'connection refused: the service is not running' : err.cause?.code || err.message;
+    return Response.json({ configured: true, online: false, error: code });
   }
 }
 

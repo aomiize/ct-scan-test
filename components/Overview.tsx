@@ -89,7 +89,7 @@ export default function Overview({ a, viewport, onGenerate, onPrint, onCsv, busy
         </div>
         <div className="panel">
           <div className="panel-head">
-            <div><h3>3D model</h3><p>Surface of each label from the segmentation mask</p></div>
+            <div><h3>3D model</h3><p>{a.mask ? 'Surface of each label from the segmentation mask' : 'Body surface and bone from the CT; tissue layers appear after segmentation'}</p></div>
           </div>
           <Mesh3D vol={vol} mask={mask?.data ?? null} labels={labels} sliceK={a.cur.k} l3={l3} />
         </div>

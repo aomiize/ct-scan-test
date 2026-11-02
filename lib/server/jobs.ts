@@ -1,6 +1,7 @@
 import 'server-only';
 import { randomUUID } from 'node:crypto';
 import { NextRequest } from 'next/server';
+import { takeUpload, validId } from './uploads';
 
 /**
  * Background jobs for long requests (segmentation, DICOM conversion, report generation).
@@ -29,11 +30,26 @@ type Handler = (req: NextRequest) => Promise<Response>;
 /** Wrap a POST handler so it can run as a background job when the request asks for it. */
 export function asyncable(handler: Handler): Handler {
   return async (req) => {
-    if (req.headers.get('x-async') !== '1') return handler(req);
+    const uploadId = req.headers.get('x-upload-id');
+    if (req.headers.get('x-async') !== '1' && !uploadId) return handler(req);
     sweep();
-    // Read the whole upload first: the request is finished once we answer 202.
-    const body = await req.arrayBuffer();
+    // Read the whole upload first: the request is finished once we answer 202. A chunked upload (X-Upload-Id)
+    // was already stored piece by piece; take it from disk instead of the request body.
+    let body: ArrayBuffer;
+    if (uploadId) {
+      if (!validId(uploadId)) return new Response('Bad upload id.', { status: 400 });
+      try {
+        body = await takeUpload(uploadId);
+      } catch {
+        return new Response('Unknown or expired upload. Try again.', { status: 404 });
+      }
+    } else body = await req.arrayBuffer();
     const headers = new Headers(req.headers);
+    headers.delete('x-upload-id');
+    if (req.headers.get('x-async') !== '1') {
+      headers.set('content-length', String(body.byteLength));
+      return handler(new NextRequest(req.url, { method: 'POST', headers, body }));
+    }
     headers.delete('x-async');
     headers.set('content-length', String(body.byteLength));
     const copy = new NextRequest(req.url, { method: 'POST', headers, body });

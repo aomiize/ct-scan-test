@@ -27,7 +27,7 @@ import { buildLut, stepCursor } from '@/lib/views';
 import { volumeStats } from '@/lib/volumetrics';
 import { validateEdgePayload } from '@/lib/edge';
 import { buildEdgePayload, edgeRange } from '@/lib/edge-build';
-import { postJob } from '@/lib/job-client';
+import { postJob, type Progress } from '@/lib/job-client';
 
 const VIEWS: ViewName[] = ['axial', 'coronal', 'sagittal'];
 const TABS = [
@@ -44,6 +44,16 @@ const isMaskName = (n: string) => /(seg|mask|label|lbl)/i.test(n);
 const tick = () => new Promise((r) => setTimeout(r, 16));
 const EMPTY_PATIENT: Patient = { sex: '', age: '', heightCm: '', weightKg: '' };
 const log = sessionLog.add;
+
+/** Status line for an upload or a background job: "Uploading 42% (25 of 60 MB)" or "Segmenting… 3:05". */
+function progressText(p: Parameters<Progress>[0], waiting: string) {
+  if (p.phase === 'upload') {
+    const pct = p.total ? Math.round(((p.done ?? 0) / p.total) * 100) : 0;
+    return `Uploading ${pct}% (${((p.done ?? 0) / 1e6).toFixed(0)} of ${((p.total ?? 0) / 1e6).toFixed(0)} MB)…`;
+  }
+  const s = p.seconds ?? 0;
+  return `${waiting}… ${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
 
 async function errorText(res: Response) {
   const t = await res.text();
@@ -289,7 +299,7 @@ export default function Workstation() {
     // store without compression: DICOM pixel data barely compresses and this keeps it fast
     const body = new Blob([await new Promise<Uint8Array>((res, rej) => zipFiles(entries, { level: 0 }, (e, d) => (e ? rej(e) : res(d))))], { type: 'application/zip' });
     setStatus({ text: 'Converting DICOM on the inference server…' });
-    const r = await postJob('/api/convert', { headers: { 'Content-Type': 'application/zip' }, body }, (sec) => setStatus({ text: `Converting DICOM on the inference server… ${sec} s` }));
+    const r = await postJob('/api/convert', { headers: { 'Content-Type': 'application/zip' }, body }, (p) => setStatus({ text: progressText(p, 'Converting DICOM on the inference server') }));
     if (!r.ok) throw new Error(await errorText(r));
     let info = '';
     try {
@@ -378,12 +388,23 @@ export default function Workstation() {
     const t0 = performance.now();
     try {
       setBusy(true);
+      // Check the edge device first, so an offline server is reported in a second instead of after a 60 MB upload.
+      setStatus({ text: 'Checking the segmentation server…' });
+      try {
+        const d = (await (await fetch('/api/device', { cache: 'no-store' })).json()) as { configured?: boolean; online?: boolean; error?: string };
+        if (d.configured && d.online === false) {
+          throw new Error(`The segmentation server on the edge device is not reachable (${d.error ?? 'no answer'}). Check that the device is on and its segmentation service is running, then try again.`);
+        }
+      } catch (err) {
+        if ((err as Error).message.startsWith('The segmentation server')) throw err;
+        // the check itself failed (web server unreachable): let the upload below report it with retries
+      }
       setStatus({ text: `Sending ${ctFile.name} to the segmentation server…` });
       log('INFO', 'INFERENCE', `uploading ${ctFile.name} (${(ctFile.size / 1e6).toFixed(1)} MB)`);
       const res = await postJob('/api/segment', {
         headers: { 'Content-Type': 'application/octet-stream', 'X-Filename': encodeURIComponent(ctFile.name) },
         body: ctFile,
-      }, (sec) => setStatus({ text: `Segmenting on the edge device… ${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}` }));
+      }, (p) => setStatus({ text: progressText(p, 'Segmenting on the edge device') }));
       const runId = res.headers.get('x-run-id');
       if (!res.ok) {
         if (runId) void fetchRun(runId);
@@ -450,7 +471,7 @@ export default function Workstation() {
         log('INFO', 'PRIVACY', `whitelist check passed: 8 numeric fields, ${check.bytes} bytes, no identifiers`);
         log('INFO', 'REPORT', `sending ${check.bytes} bytes to ${llm.model}`);
         try {
-          const r = await postJob('/api/report', { headers: { 'Content-Type': 'application/json' }, body }, (sec) => setStatus({ text: `Waiting for ${llm.model}… ${sec} s` }));
+          const r = await postJob('/api/report', { headers: { 'Content-Type': 'application/json' }, body }, (p) => setStatus({ text: progressText(p, `Waiting for ${llm.model}`) }));
           if (!r.ok) throw new Error(await errorText(r));
           g = (await r.json()) as GeneratedReport;
           log('SUCCESS', 'REPORT', `draft received in ${g.latencyMs} ms${(g.attempts ?? 1) > 1 ? ' after a retry' : ''}${g.unverifiedNumbers.length ? `; ${g.unverifiedNumbers.length} unverified numbers` : ''}`);

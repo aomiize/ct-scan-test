@@ -7,9 +7,15 @@ import type { LabelMap, Role, Volume } from '@/lib/types';
 import { isLandmark, ROLE_COLOR } from '@/lib/labels';
 
 // Each fat compartment is its own group so subcutaneous and visceral fat can be shown separately.
-type Group = Role;
+// 'body' is the skin surface taken from the CT itself, shown before any segmentation exists.
+type Group = Role | 'body';
 const GROUP_OF: Record<Role, Group> = { muscle: 'muscle', sat: 'sat', vat: 'vat', imat: 'imat', bone: 'bone', other: 'other' };
-const ALL_ON: Record<Group, boolean> = { muscle: true, sat: true, vat: true, imat: true, bone: true, other: false };
+const ALL_ON: Record<Group, boolean> = { muscle: true, sat: true, vat: true, imat: true, bone: true, other: false, body: true };
+/** Label number used for the CT-derived body surface when there is no mask. */
+const BODY_LABEL = 255;
+const BODY_HU = -400;
+const BODY_INFO = { name: 'Body surface', role: 'other' as Role, color: [214, 176, 150] as [number, number, number], visible: true };
+const BODY_OPACITY = 0.14;
 const OPACITY: Record<Role, number> = { muscle: 0.55, sat: 0.16, vat: 0.4, imat: 0.6, bone: 1, other: 0.5 };
 const FAT_LAYERS: [Role, string][] = [['sat', 'Subcutaneous fat'], ['vat', 'Visceral fat'], ['imat', 'Intermuscular fat']];
 const MAX_DIM = 112;
@@ -19,6 +25,7 @@ const BONE_COLOR = 'rgb(226,230,240)';
 
 interface Props {
   vol: Volume | null;
+  /** Without a mask the model is built from the CT alone: body surface and bone from HU thresholds. */
   mask: Uint8Array | null;
   labels: LabelMap;
   sliceK: number;
@@ -29,18 +36,22 @@ interface Props {
  * Surface mesh of each label from the (downsampled) mask: one quad for every voxel face that borders a different label.
  * Axes: +X patient left, +Y superior, +Z anterior, in millimetres, so the default camera looks at the patient from the front.
  */
-function buildMeshes(vol: Volume, mask: Uint8Array, labels: LabelMap) {
+function buildMeshes(vol: Volume, mask: Uint8Array | null, labels: LabelMap) {
   const f = Math.max(1, Math.ceil(Math.max(vol.nx, vol.ny) / MAX_DIM));
   const fz = Math.max(1, Math.min(Math.ceil(vol.nz / MAX_DIM) * 2, Math.round((f * vol.sx) / vol.sz)));
   const dx = Math.ceil(vol.nx / f), dy = Math.ceil(vol.ny / f), dz = Math.ceil(vol.nz / fz);
-  const ds = new Uint8Array(dx * dy * dz);
-  for (let k = 0; k < dz; k++) {
+  const ds = mask ? new Uint8Array(dx * dy * dz) : ctBodyGrid(vol, f, fz, dx, dy, dz);
+  if (!mask) {
+    labels = { [BODY_LABEL]: BODY_INFO };
+    for (let p = 0; p < ds.length; p++) if (ds[p]) ds[p] = BODY_LABEL;
+  }
+  for (let k = 0; mask && k < dz; k++) {
     const sk = Math.min(vol.nz - 1, k * fz + (fz >> 1));
     for (let j = 0; j < dy; j++) {
       const sj = Math.min(vol.ny - 1, j * f + (f >> 1));
       for (let i = 0; i < dx; i++) {
         const si = Math.min(vol.nx - 1, i * f + (f >> 1));
-        ds[i + dx * (j + dy * k)] = mask[si + vol.nx * (sj + vol.ny * sk)];
+        ds[i + dx * (j + dy * k)] = mask![si + vol.nx * (sj + vol.ny * sk)];
       }
     }
   }
@@ -138,7 +149,68 @@ function buildMeshes(vol: Volume, mask: Uint8Array, labels: LabelMap) {
           }
         }
   }
-  return { per, bone, size: [dx * hx, dz * hz, dy * hy] as const, zOf: (k: number) => (k / fz - dz / 2 + 0.5 / fz) * hz };
+  return { per, bone, labels, size: [dx * hx, dz * hz, dy * hy] as const, zOf: (k: number) => (k / fz - dz / 2 + 0.5 / fz) * hz };
+}
+
+/**
+ * Body outline from the CT alone, on the downsampled grid: HU above -400 at the block centre, then per slice the
+ * largest 4-connected piece (drops the table and blankets) with holes filled (bowel gas and lungs are inside).
+ */
+function ctBodyGrid(vol: Volume, f: number, fz: number, dx: number, dy: number, dz: number): Uint8Array {
+  const g = new Uint8Array(dx * dy * dz);
+  const plane = dx * dy;
+  const comp = new Int32Array(plane), stack = new Int32Array(plane), outside = new Uint8Array(plane);
+  for (let k = 0; k < dz; k++) {
+    const sk = Math.min(vol.nz - 1, k * fz + (fz >> 1));
+    const base = k * plane;
+    for (let j = 0; j < dy; j++) {
+      const sj = Math.min(vol.ny - 1, j * f + (f >> 1));
+      for (let i = 0; i < dx; i++) {
+        const si = Math.min(vol.nx - 1, i * f + (f >> 1));
+        if (vol.data[si + vol.nx * (sj + vol.ny * sk)] > BODY_HU) g[base + i + dx * j] = 1;
+      }
+    }
+    // largest connected piece on this slice
+    comp.fill(0);
+    let id = 0, best = 0, bestId = 0;
+    for (let p = 0; p < plane; p++) {
+      if (!g[base + p] || comp[p]) continue;
+      id++;
+      let top = 0, size = 0;
+      stack[top++] = p;
+      comp[p] = id;
+      while (top) {
+        const q = stack[--top];
+        size++;
+        const x = q % dx, y = (q - x) / dx;
+        for (let t = 0; t < 4; t++) {
+          const r = t === 0 ? (x > 0 ? q - 1 : -1) : t === 1 ? (x < dx - 1 ? q + 1 : -1) : t === 2 ? (y > 0 ? q - dx : -1) : y < dy - 1 ? q + dx : -1;
+          if (r < 0 || comp[r] || !g[base + r]) continue;
+          comp[r] = id;
+          stack[top++] = r;
+        }
+      }
+      if (size > best) { best = size; bestId = id; }
+    }
+    for (let p = 0; p < plane; p++) g[base + p] = bestId && comp[p] === bestId ? 1 : 0;
+    if (!bestId) continue;
+    // fill holes: flood the outside from the border; anything unreached is inside the body
+    outside.fill(0);
+    let top = 0;
+    const seed = (p: number) => { if (!g[base + p] && !outside[p]) { outside[p] = 1; stack[top++] = p; } };
+    for (let x = 0; x < dx; x++) { seed(x); seed((dy - 1) * dx + x); }
+    for (let y = 0; y < dy; y++) { seed(y * dx); seed(y * dx + dx - 1); }
+    while (top) {
+      const q = stack[--top];
+      const x = q % dx, y = (q - x) / dx;
+      if (x > 0) seed(q - 1);
+      if (x < dx - 1) seed(q + 1);
+      if (y > 0) seed(q - dx);
+      if (y < dy - 1) seed(q + dx);
+    }
+    for (let p = 0; p < plane; p++) if (!outside[p]) g[base + p] = 1;
+  }
+  return g;
 }
 
 /** Zero out 6-connected pieces smaller than minSize voxels. */
@@ -260,16 +332,17 @@ export default function Mesh3D({ vol, mask, labels, sliceK, l3 }: Props) {
         (c.material as THREE.Material).dispose();
       }
     }
-    if (!vol || !mask) {
+    if (!vol) {
       setInfo('');
       t.render();
       return;
     }
     const t0 = performance.now();
-    const { per, bone, size, zOf } = buildMeshes(vol, mask, labels);
+    const { per, bone, size, zOf, labels: lm } = buildMeshes(vol, mask, labels);
+    const opacityOf = (L: number) => (L === BODY_LABEL && !mask ? BODY_OPACITY : OPACITY[lm[L].role]);
     let faces = 0;
     // draw opaque first, then translucent from inner to outer
-    const order = [...per.entries()].sort((a, b) => OPACITY[labels[a[0]].role] < OPACITY[labels[b[0]].role] ? 1 : -1);
+    const order = [...per.entries()].sort((a, b) => (opacityOf(a[0]) < opacityOf(b[0]) ? 1 : -1));
     order.forEach(([L, g], i) => {
       if (!g.idx.length) return;
       faces += g.idx.length / 6;
@@ -277,8 +350,8 @@ export default function Mesh3D({ vol, mask, labels, sliceK, l3 }: Props) {
       geo.setAttribute('position', new THREE.Float32BufferAttribute(g.pos, 3));
       geo.setAttribute('normal', new THREE.Float32BufferAttribute(g.nrm, 3));
       geo.setIndex(g.idx);
-      const d = labels[L];
-      const op = OPACITY[d.role];
+      const d = lm[L];
+      const op = opacityOf(L);
       const mat = new THREE.MeshLambertMaterial({
         color: new THREE.Color(`rgb(${d.color.join(',')})`),
         transparent: op < 1,
@@ -288,8 +361,8 @@ export default function Mesh3D({ vol, mask, labels, sliceK, l3 }: Props) {
       });
       const m = new THREE.Mesh(geo, mat);
       m.renderOrder = i;
-      m.userData.group = GROUP_OF[d.role];
-      m.userData.role = d.role;
+      m.userData.group = L === BODY_LABEL && !mask ? 'body' : GROUP_OF[d.role];
+      m.userData.role = L === BODY_LABEL && !mask ? 'body' : d.role;
       t.root.add(m);
     });
     if (bone && bone.idx.length) {
@@ -308,7 +381,7 @@ export default function Mesh3D({ vol, mask, labels, sliceK, l3 }: Props) {
     t.l3Plane.scale.set(size[0] * 1.1, size[2] * 1.1, 1);
     t.radius = Math.max(...size) * 1.6;
     t.zOf = zOf;
-    setInfo(`${faces.toLocaleString()} faces · built in ${(performance.now() - t0).toFixed(0)} ms`);
+    setInfo(`${mask ? '' : 'CT only (no segmentation yet) · '}${faces.toLocaleString()} faces · built in ${(performance.now() - t0).toFixed(0)} ms`);
     preset('iso');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [vol, mask, roleKey]);
@@ -355,7 +428,7 @@ export default function Mesh3D({ vol, mask, labels, sliceK, l3 }: Props) {
     <div className="mesh3d">
       <div className="mesh-host" ref={hostRef}>
         {error && <p className="mesh-msg">{error}</p>}
-        {!error && !mask && <p className="mesh-msg">Load a segmentation to build the 3D model.</p>}
+        {!error && !vol && <p className="mesh-msg">Open a CT to build the 3D model.</p>}
         <div className="mesh-views">
           {(['anterior', 'posterior', 'lateral', 'iso'] as const).map((v) => (
             <button type="button" key={v} onClick={() => preset(v)}>{v === 'iso' ? 'Iso' : v[0].toUpperCase() + v.slice(1)}</button>
@@ -364,9 +437,16 @@ export default function Mesh3D({ vol, mask, labels, sliceK, l3 }: Props) {
         <div className="mesh-hint">Drag to orbit · scroll to zoom · right-drag to pan</div>
       </div>
       <div className="row mesh-controls">
-        <button type="button" className="btn small" aria-pressed={show.muscle && !show.sat && !show.vat && !show.imat && !show.bone} onClick={() => { setShow({ muscle: true, sat: false, vat: false, imat: false, bone: false, other: false }); setMuscleSolid(true); }}>Isolate muscle</button>
-        <label className="check"><input type="checkbox" checked={show.muscle} onChange={() => toggle('muscle')} />Muscle</label>
-        <label className="check"><input type="checkbox" checked={muscleSolid} onChange={(e) => setMuscleSolid(e.target.checked)} />Solid muscle</label>
+        {vol && !mask && (
+          <label className="check" title={`Skin surface from CT voxels above ${BODY_HU} HU (table removed). Run segmentation to see muscle and fat.`}>
+            <input type="checkbox" checked={show.body} onChange={() => toggle('body')} />
+            <span className="sw" style={{ background: `rgb(${BODY_INFO.color.join(',')})` }} />
+            Body surface
+          </label>
+        )}
+        {mask && <button type="button" className="btn small" aria-pressed={show.muscle && !show.sat && !show.vat && !show.imat && !show.bone} onClick={() => { setShow({ muscle: true, sat: false, vat: false, imat: false, bone: false, other: false, body: false }); setMuscleSolid(true); }}>Isolate muscle</button>}
+        {mask && <label className="check"><input type="checkbox" checked={show.muscle} onChange={() => toggle('muscle')} />Muscle</label>}
+        {mask && <label className="check"><input type="checkbox" checked={muscleSolid} onChange={(e) => setMuscleSolid(e.target.checked)} />Solid muscle</label>}
         {FAT_LAYERS.filter(([r]) => present.has(r)).map(([r, name]) => (
           <label key={r} className="check">
             <input type="checkbox" checked={show[r]} onChange={() => toggle(r)} />
@@ -375,7 +455,7 @@ export default function Mesh3D({ vol, mask, labels, sliceK, l3 }: Props) {
           </label>
         ))}
         <label className="check" title={boneFromCt ? `The mask has no bone label, so bone is taken from CT voxels ≥ ${BONE_HU} HU` : undefined}><input type="checkbox" checked={show.bone} onChange={() => toggle('bone')} />{boneFromCt ? `Bone (CT ≥ ${BONE_HU} HU)` : 'Bone'}</label>
-        <label className="check"><input type="checkbox" checked={show.other} onChange={() => toggle('other')} />Other</label>
+        {mask && <label className="check"><input type="checkbox" checked={show.other} onChange={() => toggle('other')} />Other</label>}
         <button type="button" className="btn small" onClick={() => { setShow(ALL_ON); setMuscleSolid(false); preset('iso'); }}>Reset view</button>
         <span className="note sp">{info}{info && ' · amber plane = current axial, outline = L3'}</span>
       </div>
