@@ -49,7 +49,10 @@ const log = sessionLog.add;
 function progressText(p: Parameters<Progress>[0], waiting: string) {
   if (p.phase === 'upload') {
     const pct = p.total ? Math.round(((p.done ?? 0) / p.total) * 100) : 0;
-    return `Uploading ${pct}% (${((p.done ?? 0) / 1e6).toFixed(0)} of ${((p.total ?? 0) / 1e6).toFixed(0)} MB)…`;
+    const sizes = `${((p.done ?? 0) / 1e6).toFixed(0)} of ${((p.total ?? 0) / 1e6).toFixed(0)} MB`;
+    return p.retry
+      ? `Uploading ${pct}% (${sizes}). Connection slow, retrying (attempt ${p.retry + 1} of 7)…`
+      : `Uploading ${pct}% (${sizes})…`;
   }
   const s = p.seconds ?? 0;
   return `${waiting}… ${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;

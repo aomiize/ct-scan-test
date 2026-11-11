@@ -6,10 +6,14 @@
  *   has to stay open for minutes (tunnels cut those).
  * - Network failures become messages that say what happened instead of "Failed to fetch".
  */
-const CHUNK = 4 * 1024 * 1024;
-const RETRIES = 4;
+const CHUNK = 2 * 1024 * 1024;
+const RETRIES = 6;
+// A request that gets no answer in this time is abandoned and retried. Without a limit, one piece that stalls in a
+// tunnel leaves the upload "stuck" at the same percentage forever.
+const PIECE_TIMEOUT_MS = 60_000;
+const SHORT_TIMEOUT_MS = 30_000;
 
-export type Progress = (p: { phase: 'upload' | 'wait'; done?: number; total?: number; seconds?: number }) => void;
+export type Progress = (p: { phase: 'upload' | 'wait'; done?: number; total?: number; seconds?: number; retry?: number }) => void;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -24,41 +28,50 @@ function lost(what: string): ConnectionError {
   );
 }
 
-/** fetch with retries on network errors and 502/503/504 from a tunnel. */
-async function fetchRetry(url: string, init: RequestInit, what: string): Promise<Response> {
+/** fetch with a time limit per attempt, retrying on timeouts, network errors and 502/503/504 from a tunnel. */
+async function fetchRetry(url: string, init: RequestInit, what: string, timeoutMs = SHORT_TIMEOUT_MS, onRetry?: (attempt: number) => void): Promise<Response> {
   for (let attempt = 0; ; attempt++) {
+    if (attempt > 0) onRetry?.(attempt);
     try {
-      const r = await fetch(url, init);
+      const r = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
       if ((r.status === 502 || r.status === 503 || r.status === 504) && attempt < RETRIES && !r.headers.get('x-run-id')) {
         // a gateway hiccup in front of the app; our own 502/504 carry a message and are returned to the caller
         const text = await r.clone().text();
         if (!text || /bad gateway|gateway time|service unavailable|<html/i.test(text)) {
-          await sleep(1000 * 2 ** attempt);
+          await sleep(Math.min(15000, 1000 * 2 ** attempt));
           continue;
         }
       }
       return r;
     } catch {
       if (attempt >= RETRIES) throw lost(what);
-      await sleep(1000 * 2 ** attempt);
+      await sleep(Math.min(15000, 1000 * 2 ** attempt));
     }
   }
 }
 
 async function uploadChunked(body: Blob, onProgress?: Progress): Promise<string> {
-  const start = await fetchRetry('/api/uploads', { method: 'POST' }, 'while starting the upload');
-  if (!start.ok) throw new Error(`Upload could not start (HTTP ${start.status}). ${(await start.text()).slice(0, 200)}`);
+  // The size lets the server refuse at once when it lacks the disk space, instead of failing part-way.
+  const start = await fetchRetry(`/api/uploads?size=${body.size}`, { method: 'POST' }, 'while starting the upload');
+  if (!start.ok) throw new Error(start.status === 507 ? await start.text() : `Upload could not start (HTTP ${start.status}). ${(await start.text()).slice(0, 200)}`);
   const { id } = (await start.json()) as { id: string };
   let offset = 0;
   onProgress?.({ phase: 'upload', done: 0, total: body.size });
   while (offset < body.size) {
     const piece = body.slice(offset, offset + CHUNK);
-    const r = await fetchRetry(`/api/uploads/${id}?offset=${offset}`, { method: 'PUT', body: piece, headers: { 'Content-Type': 'application/octet-stream' } }, `while uploading (${Math.round((offset / body.size) * 100)}% sent)`);
+    const at = offset;
+    const r = await fetchRetry(
+      `/api/uploads/${id}?offset=${offset}`,
+      { method: 'PUT', body: piece, headers: { 'Content-Type': 'application/octet-stream' } },
+      `while uploading (${Math.round((offset / body.size) * 100)}% sent)`,
+      PIECE_TIMEOUT_MS,
+      (attempt) => onProgress?.({ phase: 'upload', done: at, total: body.size, retry: attempt }),
+    );
     if (r.status === 409) {
       offset = ((await r.json()) as { size: number }).size; // server has a different amount; continue from there
       continue;
     }
-    if (!r.ok) throw new Error(`Upload failed (HTTP ${r.status}). ${(await r.text()).slice(0, 200)}`);
+    if (!r.ok) throw new Error(r.status === 507 ? await r.text() : `Upload failed (HTTP ${r.status}). ${(await r.text()).slice(0, 200)}`);
     offset = ((await r.json()) as { size: number }).size;
     onProgress?.({ phase: 'upload', done: offset, total: body.size });
   }
@@ -80,7 +93,8 @@ export async function postJob(url: string, init: RequestInit, onProgress?: Progr
     headers.set('X-Upload-Id', id);
     body = null;
   }
-  const first = await fetchRetry(url, { ...init, method: 'POST', headers, body }, 'while starting the job');
+  // A small body (no chunked upload) may still be large-ish; allow it the piece timeout.
+  const first = await fetchRetry(url, { ...init, method: 'POST', headers, body }, 'while starting the job', PIECE_TIMEOUT_MS);
   if (first.status !== 202) return first;
   const { job } = (await first.json()) as { job: string };
   let failures = 0;
@@ -89,7 +103,7 @@ export async function postJob(url: string, init: RequestInit, onProgress?: Progr
     await sleep(2000);
     let r: Response;
     try {
-      r = await fetch(`/api/jobs/${job}`, { cache: 'no-store' });
+      r = await fetch(`/api/jobs/${job}`, { cache: 'no-store', signal: AbortSignal.timeout(SHORT_TIMEOUT_MS) });
     } catch {
       // keep polling through short drops; give up after about two minutes without any answer
       if (++failures >= 40) throw lost('while waiting for the result');

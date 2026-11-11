@@ -15,8 +15,9 @@ async function putHandler(req: NextRequest, { params }: { params: Promise<{ id: 
     const r = await appendUpload(id, offset, new Uint8Array(await req.arrayBuffer()));
     return Response.json({ size: r.size }, { status: r.conflict ? 409 : 200 });
   } catch (e) {
-    const msg = (e as NodeJS.ErrnoException).code === 'ENOENT' ? 'Unknown or expired upload.' : (e as Error).message;
-    return new Response(msg, { status: (e as NodeJS.ErrnoException).code === 'ENOENT' ? 404 : 500 });
+    const code = (e as NodeJS.ErrnoException).code;
+    const msg = code === 'ENOENT' ? 'Unknown or expired upload. Run segmentation again.' : (e as Error).message;
+    return new Response(msg, { status: code === 'ENOENT' ? 404 : code === 'ENOSPC' ? 507 : 500 });
   }
 }
 
