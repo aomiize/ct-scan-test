@@ -56,6 +56,7 @@ from urllib.parse import quote, unquote
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 
 MODEL = os.environ.get("MODEL", "demo")
 TOTALSEG_TASK = os.environ.get("TOTALSEG_TASK", "tissue_types")
@@ -297,7 +298,9 @@ async def segment(request: Request, x_filename: str = Header("ct.nii.gz"), x_api
             run.bytes = size
             run.log("DEBUG", "RECEIVE", f"{name}: {size / 1e6:.1f} MB written to scratch")
         tta = {"on": True, "off": False}.get(x_tta.strip().lower(), not DISABLE_TTA)
-        out, labels = run_model(run, ct, work, tta)
+        # Run the model in a worker thread: called directly it would block the whole server, so /health, /device and
+        # /runs (the web app's status checks and live log) would stop answering until segmentation finished.
+        out, labels = await run_in_threadpool(run_model_serial, run, ct, work, tta)
     except HTTPException:
         run.finish("failed")
         shutil.rmtree(work, ignore_errors=True)
@@ -523,6 +526,20 @@ def crop_range(img, found: dict) -> tuple[int, int, int] | None:
     if stop - start >= n:
         return None  # nothing to gain
     return axis, start, stop
+
+
+MODEL_LOCK = threading.Lock()
+
+
+def run_model_serial(run: Run, ct: Path, work: Path, tta: bool = False):
+    """One segmentation at a time: two runs side by side would share the GPU and both be slower or run out of memory."""
+    if not MODEL_LOCK.acquire(blocking=False):
+        run.log("INFO", "PIPELINE", "waiting for the segmentation that is already running to finish")
+        MODEL_LOCK.acquire()
+    try:
+        return run_model(run, ct, work, tta)
+    finally:
+        MODEL_LOCK.release()
 
 
 def run_model(run: Run, ct: Path, work: Path, tta: bool = False) -> tuple[Path, dict[int, str] | None]:
