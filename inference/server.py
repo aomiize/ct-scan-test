@@ -24,6 +24,8 @@ MODEL (env var) picks the backend:
             Label names come from the model folder's dataset.json. AUTO_L3 also applies if TotalSegmentator is installed.
             NNUNET_THREADS=1 lowers memory use; NNUNET_DEVICE=cpu forces CPU.
             DISABLE_TTA=1 (default) turns off mirroring test-time augmentation, the largest speed win.
+            CROP_T12_L4=1 (default, with AUTO_L3) finds the vertebrae first and segments only T12-L4 plus
+            CROP_MARGIN_MM (20) mm, instead of every slice of the scan.
             A request can override it with the header X-TTA: on | off (used by benchmark.py).
             nnU-Net already runs in mixed precision (FP16) on the GPU.
             (your own model; set LABEL_SCHEME=generic or totalseg to match its label numbers)
@@ -67,6 +69,10 @@ L3_LABEL = 50
 VERTEBRAE = os.environ.get("VERTEBRAE", "T12 L3 L4").split()
 VERT_LABELS = {"L3": 50, "T12": 51, "L4": 52, "L1": 53, "L2": 54, "L5": 55, "T11": 56}
 DISABLE_TTA = os.environ.get("DISABLE_TTA", "1") == "1"
+# With vertebra detection on, find T12-L4 first and run nnU-Net only on that slab (plus a margin). The model works
+# slice by slice, so time falls with the number of slices; a chest-abdomen-pelvis scan often has 3x more than needed.
+CROP_T12_L4 = os.environ.get("CROP_T12_L4", "1") == "1"
+CROP_MARGIN_MM = float(os.environ.get("CROP_MARGIN_MM", "20"))
 API_KEY = os.environ.get("API_KEY", "")
 MAX_BYTES = 1024**3
 KEEP_RUNS = 50
@@ -436,11 +442,10 @@ def nnunet_labels(folder: str) -> dict[int, str] | None:
         return None
 
 
-def detect_vertebrae(run: Run, ct: Path, tissue: Path, work: Path) -> dict[int, str]:
-    """Run TotalSegmentator's free "total" model on VERTEBRAE and write them into the tissue mask.
+def find_vertebrae(run: Run, ct: Path, work: Path) -> dict:
+    """Run TotalSegmentator's free "total" model on VERTEBRAE. Returns {roi name: boolean array} for the ones found.
 
-    Each vertebra is saved as its own file (no --ml), so label numbering inside TotalSegmentator does not matter.
-    Bone does not overlap the soft-tissue labels. Returns the labels that were added."""
+    Each vertebra is saved as its own file (no --ml), so label numbering inside TotalSegmentator does not matter."""
     import nibabel as nib
     import numpy as np
 
@@ -453,32 +458,71 @@ def detect_vertebrae(run: Run, ct: Path, tissue: Path, work: Path) -> dict[int, 
         fast += ["-nr", TOTALSEG_THREADS, "-ns", TOTALSEG_THREADS]
     with run.stage("vertebra_detection"):
         stream_cmd(run, ["TotalSegmentator", "-i", str(ct), "-o", str(outdir), "--roi_subset", *rois, *fast], "TOTALSEG-VERT")
-
-    t_img = nib.load(str(tissue))
-    t = np.asanyarray(t_img.dataobj).astype(np.uint8)
-    added: dict[int, str] = {}
+    found = {}
     for roi in rois:
         f = outdir / f"{roi}.nii.gz"
         if not f.exists():
             run.log("WARN", "VERTEBRAE", f"{roi}: no output file")
             continue
-        v = np.asanyarray(nib.load(str(f)).dataobj)
-        if v.shape != t.shape:
-            raise RuntimeError(f"{roi} mask shape {v.shape} differs from tissue mask {t.shape}")
-        sel = v > 0
+        sel = np.asanyarray(nib.load(str(f)).dataobj) > 0
         if not sel.any():
             run.log("WARN", "VERTEBRAE", f"{roi} is not inside the scanned range")
             continue
+        found[roi] = sel
+        run.log("INFO", "VERTEBRAE", f"{roi} found: {int(sel.sum())} voxels")
+    return found
+
+
+def merge_vertebrae(run: Run, tissue: Path, found: dict) -> dict[int, str]:
+    """Write found vertebrae into the tissue mask as labels 50+ (bone does not overlap soft tissue)."""
+    import nibabel as nib
+    import numpy as np
+
+    if not found:
+        return {}
+    t_img = nib.load(str(tissue))
+    t = np.asanyarray(t_img.dataobj).astype(np.uint8)
+    added: dict[int, str] = {}
+    for roi, sel in found.items():
+        if sel.shape != t.shape:
+            raise RuntimeError(f"{roi} mask shape {sel.shape} differs from tissue mask {t.shape}")
         label = VERT_LABELS[roi.split("_", 1)[1]]
         t[sel] = label
         added[label] = roi
-        run.log("INFO", "VERTEBRAE", f"{roi} found: {int(sel.sum())} voxels → label {label}")
-    if added:
-        out = nib.Nifti1Image(t, t_img.affine, t_img.header)
-        out.set_data_dtype(np.uint8)
-        out.header.set_slope_inter(1, 0)
-        nib.save(out, str(tissue))
+    out = nib.Nifti1Image(t, t_img.affine, t_img.header)
+    out.set_data_dtype(np.uint8)
+    out.header.set_slope_inter(1, 0)
+    nib.save(out, str(tissue))
+    run.log("INFO", "VERTEBRAE", "added " + ", ".join(f"{r} → label {l}" for l, r in added.items()))
     return added
+
+
+def detect_vertebrae(run: Run, ct: Path, tissue: Path, work: Path) -> dict[int, str]:
+    """Find VERTEBRAE and write them into the tissue mask. Returns the labels that were added."""
+    return merge_vertebrae(run, tissue, find_vertebrae(run, ct, work))
+
+
+def crop_range(img, found: dict) -> tuple[int, int, int] | None:
+    """Slice range covering T12 to L4 plus CROP_MARGIN_MM, along the head-feet axis of the voxel grid.
+
+    Returns (axis, start, stop) or None when T12 and L4 were not both found."""
+    import numpy as np
+
+    if "vertebrae_T12" not in found or "vertebrae_L4" not in found:
+        return None
+    axis = int(np.argmax(np.abs(img.affine[2, :3])))  # voxel axis closest to the superior direction
+    idx = []
+    for roi in ("vertebrae_T12", "vertebrae_L4"):
+        other = tuple(a for a in range(3) if a != axis)
+        hits = np.where(found[roi].any(axis=other))[0]
+        idx += [int(hits.min()), int(hits.max())]
+    spacing = float(img.header.get_zooms()[axis])
+    margin = int(np.ceil(CROP_MARGIN_MM / max(spacing, 1e-3)))
+    n = img.shape[axis]
+    start, stop = max(0, min(idx) - margin), min(n, max(idx) + margin + 1)
+    if stop - start >= n:
+        return None  # nothing to gain
+    return axis, start, stop
 
 
 def run_model(run: Run, ct: Path, work: Path, tta: bool = False) -> tuple[Path, dict[int, str] | None]:
@@ -498,10 +542,37 @@ def run_model(run: Run, ct: Path, work: Path, tta: bool = False) -> tuple[Path, 
         return out, labels
 
     if MODEL == "nnunet":
+        import nibabel as nib
+        import numpy as np
+
         inp, outdir = work / "in", work / "out"
+        have_ts = shutil.which("TotalSegmentator") or (Path(__import__("sys").executable).parent / "TotalSegmentator").exists()
+        found: dict | None = None
+        crop = None
+        full_img = None
+        inp.mkdir()
+        case = inp / ("case_0000.nii.gz" if ct.name.endswith(".gz") else "case_0000.nii")
+        if AUTO_L3 and have_ts and CROP_T12_L4:
+            try:
+                found = find_vertebrae(run, ct, work)
+                full_img = nib.load(str(ct))
+                crop = crop_range(full_img, found)
+            except Exception as e:  # noqa: BLE001
+                run.log("WARN", "VERTEBRAE", f"automatic vertebra detection failed, segmenting every slice: {str(e)[-200:]}")
+                found, crop = {}, None
         with run.stage("preprocess"):
-            inp.mkdir()
-            ct.rename(inp / ("case_0000.nii.gz" if ct.name.endswith(".gz") else "case_0000.nii"))
+            if crop:
+                axis, start, stop = crop
+                sl = [slice(None)] * 3
+                sl[axis] = slice(start, stop)
+                nib.save(full_img.slicer[tuple(sl)], str(case))
+                n = full_img.shape[axis]
+                run.log("INFO", "CROP", f"segmenting slices {start + 1}-{stop} of {n} (T12-L4 plus {CROP_MARGIN_MM:g} mm): "
+                                        f"{stop - start} instead of {n}")
+            else:
+                if found is not None:
+                    run.log("INFO", "CROP", "T12 and L4 not both found; segmenting every slice")
+                ct.rename(case)
         folder = os.environ.get("NNUNET_MODEL_FOLDER", "")
         if folder:
             # A trained model folder copied as-is (plans.json, dataset.json, fold_X/checkpoint_*.pth),
@@ -524,14 +595,29 @@ def run_model(run: Run, ct: Path, work: Path, tta: bool = False) -> tuple[Path, 
         run.log("INFO", "NNUNET", f"test-time augmentation (mirroring) {'ON' if tta else 'OFF'}")
         with run.stage("inference"):
             stream_cmd(run, cmd, "NNUNET")
-        found = sorted(outdir.glob("case.nii*"))
-        if not found:
+        result = sorted(outdir.glob("case.nii*"))
+        if not result:
             raise RuntimeError("nnU-Net produced no output file.")
-        out = found[0]
+        out = result[0]
+        if crop:
+            # put the slab back into a mask the size of the whole scan
+            with run.stage("postprocess"):
+                part = np.asanyarray(nib.load(str(out)).dataobj).astype(np.uint8)
+                full = np.zeros(full_img.shape[:3], np.uint8)
+                sl = [slice(None)] * 3
+                sl[crop[0]] = slice(crop[1], crop[2])
+                full[tuple(sl)] = part
+                out = work / "tissue_full.nii.gz"
+                img = nib.Nifti1Image(full, full_img.affine, full_img.header)
+                img.set_data_dtype(np.uint8)
+                img.header.set_slope_inter(1, 0)
+                nib.save(img, str(out))
         labels = nnunet_labels(folder) if folder else None
-        if AUTO_L3 and (shutil.which("TotalSegmentator") or (Path(__import__("sys").executable).parent / "TotalSegmentator").exists()):
+        if AUTO_L3 and have_ts:
             try:
-                labels = {**(labels or {}), **detect_vertebrae(run, next(inp.iterdir()), out, work)}
+                if found is None:  # cropping off: detect after segmentation, as before
+                    found = find_vertebrae(run, ct if ct.exists() else case, work)
+                labels = {**(labels or {}), **merge_vertebrae(run, out, found)}
             except Exception as e:  # noqa: BLE001
                 run.log("WARN", "VERTEBRAE", f"automatic vertebra detection failed, set L3 by hand: {str(e)[-200:]}")
         return out, labels
