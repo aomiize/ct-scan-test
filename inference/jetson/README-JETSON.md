@@ -116,8 +116,8 @@ INFERENCE_API_KEY=change-me
 
 - **TTA is off by default** (`DISABLE_TTA=1`). nnU-Net's 8-way mirroring test-time augmentation is the single largest
   slowdown; set `DISABLE_TTA=0` to turn it back on. The Run log tab shows `TTA on/off` for each run.
-- **T12–L4 crop:** with `AUTO_L3=1` the server finds the vertebrae first and runs nnU-Net only on T12–L4 plus
-  20 mm (`CROP_MARGIN_MM`), not on every slice of the scan. Set `CROP_T12_L4=0` to segment every slice.
+- **Vertebra detection in parallel:** with `AUTO_L3=1`, T12/L3/L4 detection runs at the same time as nnU-Net on
+  the whole scan (`PARALLEL_VERTEBRAE=1`, default). Optional `CROP_T12_L4=1` segments only T12–L4 plus 20 mm.
 - **FP16:** nnU-Net already runs inference in mixed precision (`torch.autocast`) on the GPU; nothing to set.
 - **T12–L4 range:** with `AUTO_L3=1` and TotalSegmentator installed, the server also finds T12 and L4 (labels 51, 52)
   so the eight transmitted values cover exactly T12–L4. Change the list with `VERTEBRAE="T12 L3 L4"`.

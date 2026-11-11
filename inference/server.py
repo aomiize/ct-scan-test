@@ -24,8 +24,8 @@ MODEL (env var) picks the backend:
             Label names come from the model folder's dataset.json. AUTO_L3 also applies if TotalSegmentator is installed.
             NNUNET_THREADS=1 lowers memory use; NNUNET_DEVICE=cpu forces CPU.
             DISABLE_TTA=1 (default) turns off mirroring test-time augmentation, the largest speed win.
-            CROP_T12_L4=1 (default, with AUTO_L3) finds the vertebrae first and segments only T12-L4 plus
-            CROP_MARGIN_MM (20) mm, instead of every slice of the scan.
+            Vertebra detection runs at the same time as nnU-Net, so it adds little to the total time.
+            CROP_T12_L4=1 (off by default) segments only T12-L4 plus CROP_MARGIN_MM (20) mm instead of the whole scan.
             A request can override it with the header X-TTA: on | off (used by benchmark.py).
             nnU-Net already runs in mixed precision (FP16) on the GPU.
             (your own model; set LABEL_SCHEME=generic or totalseg to match its label numbers)
@@ -70,10 +70,12 @@ L3_LABEL = 50
 VERTEBRAE = os.environ.get("VERTEBRAE", "T12 L3 L4").split()
 VERT_LABELS = {"L3": 50, "T12": 51, "L4": 52, "L1": 53, "L2": 54, "L5": 55, "T11": 56}
 DISABLE_TTA = os.environ.get("DISABLE_TTA", "1") == "1"
-# With vertebra detection on, find T12-L4 first and run nnU-Net only on that slab (plus a margin). The model works
-# slice by slice, so time falls with the number of slices; a chest-abdomen-pelvis scan often has 3x more than needed.
-CROP_T12_L4 = os.environ.get("CROP_T12_L4", "1") == "1"
+# Optional (off by default, because the whole body is segmented): find T12-L4 first and run nnU-Net only on that
+# slab plus a margin. The model works slice by slice, so this cuts time roughly in proportion to the slices skipped.
+CROP_T12_L4 = os.environ.get("CROP_T12_L4", "0") == "1"
 CROP_MARGIN_MM = float(os.environ.get("CROP_MARGIN_MM", "20"))
+# Run vertebra detection at the same time as nnU-Net (1) or after it (0).
+PARALLEL_VERTEBRAE = os.environ.get("PARALLEL_VERTEBRAE", "1") == "1"
 API_KEY = os.environ.get("API_KEY", "")
 MAX_BYTES = 1024**3
 KEEP_RUNS = 50
@@ -577,6 +579,26 @@ def run_model(run: Run, ct: Path, work: Path, tta: bool = False) -> tuple[Path, 
             except Exception as e:  # noqa: BLE001
                 run.log("WARN", "VERTEBRAE", f"automatic vertebra detection failed, segmenting every slice: {str(e)[-200:]}")
                 found, crop = {}, None
+        # Whole-body mode: start vertebra detection now, in parallel with nnU-Net. Both read the same input file;
+        # TotalSegmentator's fast vertebra model is small, so the two share the GPU without running out of memory.
+        vert_thread = None
+        vert_result: dict = {}
+        if AUTO_L3 and have_ts and found is None and PARALLEL_VERTEBRAE:
+            src = work / ("ct_vert.nii.gz" if ct.name.endswith(".gz") else "ct_vert.nii")
+            try:
+                os.link(ct, src)  # second name for the same file: costs no disk space
+            except OSError:
+                shutil.copy2(ct, src)
+
+            def _vert():
+                try:
+                    vert_result["found"] = find_vertebrae(run, src, work)
+                except Exception as e:  # noqa: BLE001
+                    vert_result["error"] = e
+
+            vert_thread = threading.Thread(target=_vert, daemon=True)
+            vert_thread.start()
+            run.log("INFO", "VERTEBRAE", "vertebra detection started alongside segmentation")
         with run.stage("preprocess"):
             if crop:
                 axis, start, stop = crop
@@ -632,7 +654,14 @@ def run_model(run: Run, ct: Path, work: Path, tta: bool = False) -> tuple[Path, 
         labels = nnunet_labels(folder) if folder else None
         if AUTO_L3 and have_ts:
             try:
-                if found is None:  # cropping off: detect after segmentation, as before
+                if vert_thread is not None:
+                    if vert_thread.is_alive():
+                        run.log("INFO", "VERTEBRAE", "segmentation done; waiting for vertebra detection")
+                    vert_thread.join()
+                    if "error" in vert_result:
+                        raise vert_result["error"]
+                    found = vert_result.get("found", {})
+                elif found is None:  # detect after segmentation (PARALLEL_VERTEBRAE=0)
                     found = find_vertebrae(run, ct if ct.exists() else case, work)
                 labels = {**(labels or {}), **merge_vertebrae(run, out, found)}
             except Exception as e:  # noqa: BLE001
